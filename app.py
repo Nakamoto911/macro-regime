@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+from yahooquery import Ticker
 
 # Page configuration
 st.set_page_config(
@@ -348,10 +349,9 @@ def load_fred_md_data_safe(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
         # Capacity is usually a percentage, keep as level or divide by 100? 
         # FRED code is 1 or 2 usually. We keep as is.
         
-        # Clean infinite values created by log transformations
-        data = data.replace([np.inf, -np.inf], np.nan)
-        
-        return data.dropna()
+        # Final cleaning for stability
+        data = data.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return data
         
     except Exception as e:
         st.error(f"Error loading FRED-MD data: {e}")
@@ -362,29 +362,46 @@ def load_fred_md_data_safe(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def generate_asset_prices(n_periods: int = 120) -> pd.DataFrame:
-    """Generate simulated asset price data."""
-    np.random.seed(123)
-    dates = pd.date_range(end=datetime.now(), periods=n_periods, freq='ME')
+def get_real_asset_prices(start_date: str = '2004-12-01') -> pd.DataFrame:
+    """Fetch real historical asset price data from Yahoo Finance."""
+    tickers = {
+        'EQUITY': 'SPY',
+        'BONDS': 'TLT',
+        'GOLD': 'GLD'
+    }
     
-    # US Equities (SPY proxy)
-    equity_returns = np.random.randn(n_periods) * 0.04 + 0.008
-    equity_prices = 100 * np.exp(np.cumsum(equity_returns))
+    t = Ticker(list(tickers.values()))
     
-    # US Bonds (TLT proxy)
-    bond_returns = np.random.randn(n_periods) * 0.02 + 0.003
-    bond_prices = 100 * np.exp(np.cumsum(bond_returns))
+    # Fetch history since start_date. FRED-MD usually goes back far, 
+    # but TLT/GLD started in the early 2000s.
+    df_history = t.history(start=start_date, interval='1mo')
     
-    # Gold (GLD proxy)
-    gold_returns = np.random.randn(n_periods) * 0.03 + 0.005
-    gold_prices = 100 * np.exp(np.cumsum(gold_returns))
+    if isinstance(df_history, dict):
+        # Handle cases where yahooquery might return a dict of dfs
+        all_dfs = []
+        for symbol, df in df_history.items():
+            if isinstance(df, pd.DataFrame):
+                df['symbol'] = symbol
+                all_dfs.append(df)
+        df_history = pd.concat(all_dfs)
+
+    # Pivot to get symbols as columns
+    df_prices = df_history.reset_index().pivot(index='date', columns='symbol', values='adjclose')
     
-    return pd.DataFrame({
-        'date': dates,
-        'EQUITY': equity_prices,
-        'BONDS': bond_prices,
-        'GOLD': gold_prices
-    }).set_index('date')
+    # Map symbols back to our names
+    inv_tickers = {v: k for k, v in tickers.items()}
+    df_prices = df_prices.rename(columns=inv_tickers)
+    
+    # Keep only target columns and drop NaNs
+    df_prices = df_prices[list(tickers.keys())].dropna()
+    
+    # Ensure index is datetime and localized/unlocalized consistently
+    df_prices.index = pd.to_datetime(df_prices.index).tz_localize(None)
+    
+    # Rename index to 'date' for consistency if needed (already 'date' from reset_index)
+    df_prices.index.name = 'date'
+    
+    return df_prices
 
 
 # ============================================================================
@@ -590,7 +607,10 @@ class AdaptiveElasticNetVECM:
         
         # Generate cointegration vectors
         self.beta = np.random.randn(n_vars, self.cointegration_rank) * 0.1
-        self.beta = self.beta / np.linalg.norm(self.beta, axis=0)
+        # Add safety for normalization
+        norms = np.linalg.norm(self.beta, axis=0)
+        norms[norms == 0] = 1.0
+        self.beta = self.beta / norms
         
         return {
             'rank': self.cointegration_rank,
@@ -609,7 +629,9 @@ class AdaptiveElasticNetVECM:
         selected_cols = levels.columns[:n_vars]
         
         try:
-            ect = levels[selected_cols].values @ self.beta[:n_vars, 0]
+            # Ruggedized matmul with nan_to_num
+            vals = np.nan_to_num(levels[selected_cols].values, nan=0.0, posinf=0.0, neginf=0.0)
+            ect = vals @ self.beta[:n_vars, 0]
             self.ect = pd.Series(ect, index=levels.index, name='ECT')
         except Exception:
             self.ect = pd.Series(0, index=levels.index, name='ECT')
@@ -1128,16 +1150,16 @@ def main():
             index=2
         )
         
-        run_model = st.button("⟳ RUN MODEL", use_container_width=True)
+        run_model = st.button("⟳ RUN MODEL", width='stretch')
     
     # Load/Generate Data
     macro_data = load_fred_md_data_safe()
     
     # Extra safety: ensure no infinite values persist
     if not macro_data.empty:
-        macro_data = macro_data.replace([np.inf, -np.inf], np.nan).dropna()
+        macro_data = macro_data.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         
-    asset_prices = generate_asset_prices(n_periods)
+    asset_prices = get_real_asset_prices().tail(n_periods)
     
     # Initialize model components
     kernel_dict = KernelDictionary()
@@ -1309,7 +1331,7 @@ def main():
         st.dataframe(
             cycle_data,
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
             column_config={
                 'Block': st.column_config.TextColumn('FRED-MD Block', width='small'),
                 'Variables': st.column_config.TextColumn('Grouped Variables', width='medium'),
@@ -1386,7 +1408,7 @@ def main():
                 'Reject H0': ['Yes' if t > c else 'No' for t, c in zip(coint_results['trace_stats'], coint_results['critical_values'])]
             })
             
-            st.dataframe(coint_df, hide_index=True, use_container_width=True)
+            st.dataframe(coint_df, hide_index=True, width='stretch')
             
             st.markdown(f"""
             <div style="margin-top: 0.5rem; padding: 0.75rem; background: #1a1a1a; border-radius: 2px;">
@@ -1406,7 +1428,7 @@ def main():
                 'Weighting': ['Direct', 'Direct', 'Gaussian', 'Gaussian', 'Gaussian', 'Gaussian', 'Gaussian']
             })
             
-            st.dataframe(kernel_info, hide_index=True, use_container_width=True)
+            st.dataframe(kernel_info, hide_index=True, width='stretch')
         
         st.markdown('<div class="panel-header">SHORT-RUN DYNAMICS (MACRO Γ COEFFICIENTS)</div>', unsafe_allow_html=True)
         st.plotly_chart(plot_coef_heatmap(gamma), use_container_width=True, config={'displayModeBar': False})
@@ -1464,7 +1486,7 @@ def main():
             })
         
         orders_df = pd.DataFrame(orders_data)
-        st.dataframe(orders_df, hide_index=True, use_container_width=True)
+        st.dataframe(orders_df, hide_index=True, width='stretch')
     
     # Footer
     st.markdown("""
