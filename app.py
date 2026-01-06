@@ -276,8 +276,8 @@ st.markdown("""
 # ============================================================================
 
 @st.cache_data(ttl=3600)
-def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
-    """Load and process FRED-MD data from CSV."""
+def load_fred_md_data_safe(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
+    """Load and process FRED-MD data from CSV (Safe Version)."""
     try:
         # Load data (row 0 contains transformation codes)
         df_raw = pd.read_csv(file_path)
@@ -347,6 +347,9 @@ def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
                     
         # Capacity is usually a percentage, keep as level or divide by 100? 
         # FRED code is 1 or 2 usually. We keep as is.
+        
+        # Clean infinite values created by log transformations
+        data = data.replace([np.inf, -np.inf], np.nan)
         
         return data.dropna()
         
@@ -489,6 +492,68 @@ class RegimeSentinel:
             self.status = "CALM"
         
         return self.status, self.stress_score, indicators
+    
+    def compute_history(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Compute historical regime status (vectorized)."""
+        df = data.copy()
+        
+        # 1. Credit Stress (Widening Spreads)
+        # Using 24m rolling Z-score to capture cycle turns
+        if 'BAA_AAA' in df.columns:
+            roll_mean = df['BAA_AAA'].rolling(48).mean()
+            roll_std = df['BAA_AAA'].rolling(48).std()
+            df['credit_stress'] = (df['BAA_AAA'] - roll_mean) / roll_std
+        
+        # 2. Curve Stress (Inversion)
+        if 'SPREAD' in df.columns:
+            roll_mean = df['SPREAD'].rolling(48).mean()
+            roll_std = df['SPREAD'].rolling(48).std()
+            # Inversion (negative) -> High Stress
+            df['curve_stress'] = -(df['SPREAD'] - roll_mean) / roll_std
+
+        # 3. Production Stress (YoY Contraction)
+        if 'INDPRO' in df.columns:
+            yoy = df['INDPRO'].pct_change(12)
+            # Negative growth -> High Stress. Normalize by 2% std dev proxy
+            df['prod_stress'] = -yoy / 0.02
+
+        # 4. Employment Stress (Sahm Rule-ish)
+        if 'UNRATE' in df.columns:
+            # Change from 12m low
+            low_12m = df['UNRATE'].rolling(12).min()
+            df['emp_stress'] = (df['UNRATE'] - low_12m) / 0.5 # 0.5% rise is trigger
+            
+        # Composite Score
+        features = ['credit_stress', 'curve_stress', 'prod_stress', 'emp_stress']
+        available = [f for f in features if f in df.columns]
+        
+        if not available:
+            return pd.DataFrame()
+            
+        df = df[available].fillna(0)
+        
+        # Weighted sum (matching single-point logic)
+        weights = {'credit_stress': 0.35, 'curve_stress': 0.25, 'prod_stress': 0.25, 'emp_stress': 0.15}
+        df['score'] = sum(df[col] * weights[col] for col in available)
+        
+        # Smooth score
+        df['score_smooth'] = df['score'].rolling(3).mean()
+        
+        # Assign Regimes
+        # > 1.5 -> Contraction (Crisis)
+        # 0.5 to 1.5 -> Peak (Slowdown)
+        # < -0.5 -> Recovery (Trough)
+        # -0.5 to 0.5 -> Expansion (Goldilocks)
+        
+        def get_regime(score):
+            if score > 1.5: return 'Contraction'
+            if score > 0.5: return 'Peak'
+            if score < -0.5: return 'Trough'
+            return 'Expansion'
+            
+        df['regime'] = df['score_smooth'].apply(get_regime)
+        
+        return df[['score', 'regime']]
 
 
 class AdaptiveElasticNetVECM:
@@ -543,9 +608,12 @@ class AdaptiveElasticNetVECM:
         n_vars = min(len(levels.columns), self.beta.shape[0])
         selected_cols = levels.columns[:n_vars]
         
-        ect = levels[selected_cols].values @ self.beta[:n_vars, 0]
-        self.ect = pd.Series(ect, index=levels.index, name='ECT')
-        
+        try:
+            ect = levels[selected_cols].values @ self.beta[:n_vars, 0]
+            self.ect = pd.Series(ect, index=levels.index, name='ECT')
+        except Exception:
+            self.ect = pd.Series(0, index=levels.index, name='ECT')
+            
         return self.ect
     
     def estimate_gamma(self, changes: pd.DataFrame, kernel_features: pd.DataFrame) -> pd.DataFrame:
@@ -901,25 +969,19 @@ def plot_asset_performance(prices: pd.DataFrame, weights_history: list = None) -
     return fig
 
 
-def plot_regime_timeline(macro_data: pd.DataFrame) -> go.Figure:
+def plot_regime_timeline(macro_data: pd.DataFrame, regime_history: pd.DataFrame = None) -> go.Figure:
     """Create regime detection timeline."""
     theme = create_plotly_theme()
     
-    # Simulate regime states based on data
-    n = len(macro_data)
-    regimes = []
-    
-    for i in range(n):
-        if i < 20:
-            regimes.append('Expansion')
-        elif i < 40:
-            regimes.append('Peak')
-        elif i < 60:
-            regimes.append('Contraction')
-        elif i < 80:
-            regimes.append('Trough')
-        else:
-            regimes.append('Expansion')
+    if regime_history is None or regime_history.empty:
+        # Fallback if no history computed
+        regimes = ['Expansion'] * len(macro_data)
+        dates = macro_data.index
+    else:
+        # Align dates
+        common = macro_data.index.intersection(regime_history.index)
+        regimes = regime_history.loc[common, 'regime'].tolist()
+        dates = common
     
     regime_colors = {
         'Expansion': '#00d26a',
@@ -934,22 +996,41 @@ def plot_regime_timeline(macro_data: pd.DataFrame) -> go.Figure:
     
     fig = go.Figure()
     
-    # Background regions
-    for i in range(len(macro_data) - 1):
+    # Background regions (optimized loop to create blocks)
+    # Finding state changes to draw rectangles instead of 1000 lines
+    
+    if len(dates) > 0:
+        current_state = regimes[0]
+        start_date = dates[0]
+        
+        for i in range(1, len(dates)):
+            if regimes[i] != current_state:
+                # End of block
+                fig.add_vrect(
+                    x0=start_date,
+                    x1=dates[i],
+                    fillcolor=regime_colors.get(current_state, '#111'),
+                    opacity=0.15,
+                    line_width=0
+                )
+                current_state = regimes[i]
+                start_date = dates[i]
+        
+        # Last block
         fig.add_vrect(
-            x0=macro_data.index[i],
-            x1=macro_data.index[i+1],
-            fillcolor=regime_colors[regimes[i]],
+            x0=start_date,
+            x1=dates[-1],
+            fillcolor=regime_colors.get(current_state, '#111'),
             opacity=0.15,
             line_width=0
         )
     
     # Add regime line
     fig.add_trace(go.Scatter(
-        x=macro_data.index,
+        x=dates,
         y=regime_values,
         mode='lines',
-        line=dict(color='#ffffff', width=1),
+        line=dict(color='#ffffff', width=1, shape='hv'), # step chart
         hovertemplate='%{x|%b %Y}<br>Regime: ' + '%{text}<extra></extra>',
         text=regimes
     ))
@@ -1050,7 +1131,12 @@ def main():
         run_model = st.button("⟳ RUN MODEL", use_container_width=True)
     
     # Load/Generate Data
-    macro_data = load_fred_md_data()
+    macro_data = load_fred_md_data_safe()
+    
+    # Extra safety: ensure no infinite values persist
+    if not macro_data.empty:
+        macro_data = macro_data.replace([np.inf, -np.inf], np.nan).dropna()
+        
     asset_prices = generate_asset_prices(n_periods)
     
     # Initialize model components
@@ -1078,9 +1164,16 @@ def main():
     
     # Step 6: Gamma estimation
     gamma = vecm.estimate_gamma(changes, kernel_features)
+    active_vars = (gamma.values != 0).sum()
     
     # Step 7: Portfolio signals
     signals = allocator.generate_signals(ect, status, stress_score)
+
+    # Step 8: Asset Equations (New)
+    asset_returns = np.log(asset_prices).diff().dropna()
+    # Align data
+    common_idx = asset_returns.index.intersection(kernel_features.index)
+    asset_gamma = vecm.estimate_gamma(asset_returns.loc[common_idx], kernel_features.loc[common_idx])
     
     # =========================================================================
     # DASHBOARD LAYOUT
@@ -1165,8 +1258,11 @@ def main():
             st.plotly_chart(plot_ect_series(ect), use_container_width=True, config={'displayModeBar': False})
     
     with tab2:
+        # Compute history for plotting
+        regime_history = sentinel.compute_history(macro_data)
+        
         st.markdown('<div class="panel-header">REGIME TIMELINE</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_regime_timeline(macro_data), use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(plot_regime_timeline(macro_data, regime_history), use_container_width=True, config={'displayModeBar': False})
         
         st.markdown('<div class="panel-header">MACRO INDICATORS HEATMAP (Z-SCORES)</div>', unsafe_allow_html=True)
         st.plotly_chart(plot_macro_heatmap(macro_data), use_container_width=True, config={'displayModeBar': False})
@@ -1223,6 +1319,60 @@ def main():
         )
     
     with tab3:
+        st.markdown('<div class="panel-header">ASSET EQUATIONS</div>', unsafe_allow_html=True)
+        
+        # Definition mapping for annotations
+        def get_annotation(feature_name):
+            if 'M2' in feature_name: return 'Liquidity'
+            if 'CPI' in feature_name: return 'Inflation'
+            if 'PPI' in feature_name: return 'Inflation'
+            if 'INDPRO' in feature_name: return 'Growth'
+            if 'PAYEMS' in feature_name: return 'Labor'
+            if 'SPREAD' in feature_name: return 'Term Structure'
+            if 'FEDFUNDS' in feature_name: return 'Rates'
+            if 'BAA_AAA' in feature_name: return 'Credit Risk'
+            return 'Macro'
+
+        for asset in asset_gamma.index:
+            row = asset_gamma.loc[asset]
+            # Select top 5 features by absolute magnitude
+            top_features = row.abs().sort_values(ascending=False).head(5)
+            active_features = row[top_features.index]
+            
+            terms_latex = []
+            for feature, coef in active_features.items():
+                if abs(coef) < 0.0001: continue
+                # Tex friendly names
+                fname = feature.replace('_', r'\_')
+                annotation = get_annotation(feature)
+                sign = "+" if coef >= 0 else "-"
+                val = abs(coef)
+                
+                term = fr"\underbrace{{{val:.2f} \cdot \text{{{fname}}}}}_{{\text{{{annotation}}}}}"
+                terms_latex.append((sign, term))
+            
+            if not terms_latex:
+                equation_str = "0"
+            else:
+                # Handle first term sign
+                first_sign, first_term = terms_latex[0]
+                eq_parts = []
+                if first_sign == "-":
+                    eq_parts.append(fr"- {first_term}")
+                else:
+                    eq_parts.append(first_term)
+                
+                for sign, term in terms_latex[1:]:
+                    eq_parts.append(fr" {sign} {term}")
+                
+                equation_str = "".join(eq_parts)
+            
+            # Asset symbol
+            asset_sym = "P_t^{" + asset + "}"
+            
+            st.latex(fr"\ln({asset_sym}) = \beta_0 + {equation_str} + \epsilon_t")
+            st.divider()
+
         col1, col2 = st.columns(2)
         
         with col1:
@@ -1258,47 +1408,10 @@ def main():
             
             st.dataframe(kernel_info, hide_index=True, use_container_width=True)
         
-        st.markdown('<div class="panel-header">SHORT-RUN DYNAMICS (Γ COEFFICIENTS)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-header">SHORT-RUN DYNAMICS (MACRO Γ COEFFICIENTS)</div>', unsafe_allow_html=True)
         st.plotly_chart(plot_coef_heatmap(gamma), use_container_width=True, config={'displayModeBar': False})
         
-        # Model stability metrics
-        st.markdown('<div class="panel-header">MODEL STABILITY METRICS</div>', unsafe_allow_html=True)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            sparsity = (gamma.values == 0).mean() * 100
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-label">Γ Sparsity</div>
-                <div class="metric-value">{sparsity:.1f}%</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            active_vars = (gamma.values != 0).sum()
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-label">Active Variables</div>
-                <div class="metric-value">{active_vars}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-label">L1/L2 Ratio</div>
-                <div class="metric-value">{l1_ratio:.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col4:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-label">Time Decay</div>
-                <div class="metric-value">{decay:.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
+        # We removed the generic equation list in favor of the asset specific ones above
     
     with tab4:
         st.markdown("""
