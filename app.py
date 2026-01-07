@@ -287,8 +287,8 @@ def load_fred_md_data_safe(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
         transform_codes = df_raw.iloc[0]
         df = df_raw.iloc[1:].copy()
         
-        # Parse dates
-        df['sasdate'] = pd.to_datetime(df['sasdate'])
+        # Parse dates and ensure they are timezone-naive
+        df['sasdate'] = pd.to_datetime(df['sasdate'], utc=True).dt.tz_localize(None)
         df = df.set_index('sasdate')
         
         # Convert all columns to numeric
@@ -382,7 +382,8 @@ def get_real_asset_prices(start_date: str = '2004-12-01') -> pd.DataFrame:
         # Handle cases where yahooquery might return a dict of dfs
         all_dfs = []
         for symbol, df in df_history.items():
-            if isinstance(df, pd.DataFrame):
+                # Ensure each ticker's index is naive and consistent
+                df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
                 df['symbol'] = symbol
                 all_dfs.append(df)
         df_history = pd.concat(all_dfs)
@@ -397,8 +398,8 @@ def get_real_asset_prices(start_date: str = '2004-12-01') -> pd.DataFrame:
     # Keep only target columns and drop NaNs
     df_prices = df_prices[list(tickers.keys())].dropna()
     
-    # Ensure index is datetime and localized/unlocalized consistently
-    df_prices.index = pd.to_datetime(df_prices.index).tz_localize(None)
+    # Final safety: Ensure index is datetime and localized/unlocalized consistently
+    df_prices.index = pd.to_datetime(df_prices.index, utc=True).tz_localize(None)
     
     # Rename index to 'date' for consistency if needed (already 'date' from reset_index)
     df_prices.index.name = 'date'
