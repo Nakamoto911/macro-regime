@@ -15,6 +15,9 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from yahooquery import Ticker
+from sklearn.linear_model import ElasticNet
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 # Page configuration
 st.set_page_config(
@@ -584,6 +587,7 @@ class AdaptiveElasticNetVECM:
         self.alpha = alpha
         self.decay = decay  # Exponential time weighting
         self.cointegration_rank = None
+        self.cointegration_vars = None
         self.beta = None
         self.gamma = None
         self.ect = None
@@ -596,61 +600,65 @@ class AdaptiveElasticNetVECM:
             return np.ones(n) / n
         return decay_vals / sum_decay
     
-    def estimate_cointegration(self, levels: pd.DataFrame, n_lags: int = 4) -> dict:
-        """Estimate cointegration relationships (simplified Johansen-style)."""
-        # Simulate cointegration test results
-        n_vars = min(5, len(levels.columns))
+    def estimate_cointegration(self, levels, n_lags=4):
+        # Real Johansen Test
+        # Drop 'SPREAD' if GS10 and FEDFUNDS are present to avoid exact singularity
+        df_coint = levels.copy()
+        if 'SPREAD' in df_coint.columns and 'GS10' in df_coint.columns and 'FEDFUNDS' in df_coint.columns:
+            df_coint = df_coint.drop(columns=['SPREAD'])
+            
+        # Limit to max 12 variables (statsmodels limitation & numerical stability)
+        if len(df_coint.columns) > 12:
+            core_vars = ['INDPRO', 'CPI', 'FEDFUNDS', 'GS10', 'UNRATE', 'PAYEMS', 'HOUST', 'M2', 'PPI', 'PCE', 'CAPACITY', 'IPFINAL']
+            self.cointegration_vars = [c for c in core_vars if c in df_coint.columns][:12]
+        else:
+            self.cointegration_vars = list(df_coint.columns)
+            
+        df_coint = df_coint[self.cointegration_vars]
         
-        # Generate pseudo eigenvalues
-        eigenvalues = np.sort(np.random.uniform(0.05, 0.4, n_vars))[::-1]
-        
-        # Determine rank based on trace statistic simulation
-        trace_stats = np.cumsum(eigenvalues[::-1])[::-1] * len(levels) * 0.5
-        critical_values = [47.86, 29.80, 15.49, 3.84, 0.0][:n_vars]
-        
-        rank = sum(1 for t, c in zip(trace_stats, critical_values) if t > c)
-        self.cointegration_rank = max(1, rank)
-        
-        # Generate cointegration vectors with bounded initial values
-        self.beta = np.random.randn(n_vars, self.cointegration_rank) * 0.01
-        # Add safety for normalization
-        norms = np.linalg.norm(self.beta, axis=0)
-        norms = np.where(norms == 0, 1.0, norms)
-        self.beta = self.beta / norms
-        # Ensure beta itself is bounded
-        self.beta = np.clip(self.beta, -10, 10)
-        
-        return {
-            'rank': self.cointegration_rank,
-            'eigenvalues': eigenvalues,
-            'trace_stats': trace_stats,
-            'critical_values': critical_values
-        }
+        try:
+            jores = coint_johansen(df_coint.values, det_order=0, k_ar_diff=n_lags)
+            
+            # Store real results
+            self.cointegration_rank = 1 
+            self.beta = jores.evec[:, :self.cointegration_rank]
+            
+            return {
+                'rank': self.cointegration_rank,
+                'eigenvalues': jores.eig,
+                'trace_stats': jores.lr1,
+                'critical_values': jores.cvt[:, 1] # 5% critical values
+            }
+        except Exception as e:
+            # Failsafe if real calculation fails (numerical stability)
+            self.cointegration_rank = 1
+            self.beta = np.zeros((len(self.cointegration_vars), 1))
+            self.beta[0, 0] = 1.0 # Simple unit vector as fallback
+            
+            return {
+                'rank': self.cointegration_rank,
+                'error': str(e),
+                'status': 'fallback applied'
+            }
     
     def compute_ect(self, levels: pd.DataFrame) -> pd.Series:
         """Compute Error Correction Term."""
-        if self.beta is None:
+        if self.beta is None or self.cointegration_vars is None:
             return pd.Series(0, index=levels.index)
         
-        # Use first cointegration vector
-        n_vars = min(len(levels.columns), self.beta.shape[0])
-        selected_cols = levels.columns[:n_vars]
-        
+        # Use first cointegration vector and align columns
+        selected_cols = [c for c in self.cointegration_vars if c in levels.columns]
+        if not selected_cols:
+             return pd.Series(0, index=levels.index)
+             
         try:
-            # Ruggedized matmul with exhaustive numerical safety
-            if len(selected_cols) == 0 or self.beta is None:
-                self.ect = pd.Series(0, index=levels.index, name='ECT')
-                return self.ect
-
-            # Ensure data is numeric and clean
-            vals = np.nan_to_num(levels[selected_cols].values, nan=0.0, posinf=1e9, neginf=-1e9).astype(np.float64)
-            beta_v = np.nan_to_num(self.beta[:n_vars, 0], nan=0.0, posinf=10.0, neginf=-10.0).astype(np.float64)
+            # Align beta with available columns (though they should match)
+            vals = np.nan_to_num(levels[selected_cols].values, nan=0.0).astype(np.float64)
+            beta_v = np.nan_to_num(self.beta[:len(selected_cols), 0], nan=0.0).astype(np.float64)
             
-            # Use explicit dot product and suppress runtime warnings for this specific operation
-            # as intermediate results may temporarily overflow before being clipped
             with np.errstate(all='ignore'):
                 ect = np.dot(vals, beta_v)
-                ect = np.nan_to_num(ect, nan=0.0, posinf=1e12, neginf=-1e12)
+                ect = np.nan_to_num(ect, nan=0.0)
             
             self.ect = pd.Series(ect, index=levels.index, name='ECT')
         except Exception:
@@ -658,28 +666,37 @@ class AdaptiveElasticNetVECM:
             
         return self.ect
     
-    def estimate_gamma(self, changes: pd.DataFrame, kernel_features: pd.DataFrame) -> pd.DataFrame:
-        """Estimate short-run dynamics with Elastic Net."""
-        # Simulate sparse coefficient matrix
-        n_targets = len(changes.columns)
-        n_features = min(50, len(kernel_features.columns))
-        
-        # Ridge-heavy Elastic Net promotes grouped selection
-        gamma = np.random.randn(n_targets, n_features) * 0.1
-        
-        # Apply L1 sparsity
-        sparsity_mask = np.random.rand(n_targets, n_features) > (1 - self.l1_ratio)
-        gamma = gamma * sparsity_mask
-        
-        # Apply L2 shrinkage
-        gamma = gamma * (1 - self.alpha)
-        
-        self.gamma = pd.DataFrame(
-            gamma,
-            index=changes.columns[:n_targets],
-            columns=kernel_features.columns[:n_features]
+    def estimate_gamma(self, changes, kernel_features):
+        # Scale features for numerical stability and faster convergence
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(kernel_features)
+        X_scaled_df = pd.DataFrame(X_scaled, index=kernel_features.index, columns=kernel_features.columns)
+
+        # Real Elastic Net with increased max_iter for convergence
+        model = ElasticNet(
+            l1_ratio=self.l1_ratio, 
+            alpha=self.alpha, 
+            fit_intercept=False,
+            max_iter=5000,
+            tol=1e-3
         )
         
+        # Align indices between changes (target) and features (X)
+        common_idx = changes.index.intersection(X_scaled_df.index)
+        
+        model.fit(X_scaled_df.loc[common_idx], changes.loc[common_idx])
+        
+        coef_ = model.coef_
+        if coef_.ndim == 1:
+            coef_ = coef_.reshape(1, -1)
+            
+        # Re-scale coefficients back to original scale for interpretability if needed
+        # But for the asset equations display, we'll keep them as they are or note they are on scaled data
+        self.gamma = pd.DataFrame(
+            coef_, 
+            index=changes.columns,
+            columns=kernel_features.columns
+        )
         return self.gamma
 
 
@@ -1276,7 +1293,7 @@ def main():
         
         with col_left:
             st.markdown('<div class="panel-header">TARGET ALLOCATION</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_allocation_chart(signals['weights']), use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(plot_allocation_chart(signals['weights']), width="stretch", config={'displayModeBar': False})
             
             # Weights table
             st.markdown("""
@@ -1290,24 +1307,24 @@ def main():
             st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
             
             st.markdown('<div class="panel-header">STRESS GAUGE</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_stress_gauge(stress_score, status), use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(plot_stress_gauge(stress_score, status), width="stretch", config={'displayModeBar': False})
         
         with col_right:
             st.markdown('<div class="panel-header">ASSET PERFORMANCE (INDEXED)</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_asset_performance(asset_prices), use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(plot_asset_performance(asset_prices), width="stretch", config={'displayModeBar': False})
             
             st.markdown('<div class="panel-header">ERROR CORRECTION TERM</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_ect_series(ect), use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(plot_ect_series(ect), width="stretch", config={'displayModeBar': False})
     
     with tab2:
         # Compute history for plotting
         regime_history = sentinel.compute_history(macro_data)
         
         st.markdown('<div class="panel-header">REGIME TIMELINE</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_regime_timeline(macro_data, regime_history), use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(plot_regime_timeline(macro_data, regime_history), width="stretch", config={'displayModeBar': False})
         
         st.markdown('<div class="panel-header">MACRO INDICATORS HEATMAP (Z-SCORES)</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_macro_heatmap(macro_data), use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(plot_macro_heatmap(macro_data), width="stretch", config={'displayModeBar': False})
         
         # Stress indicators breakdown
         st.markdown('<div class="panel-header">STRESS DECOMPOSITION</div>', unsafe_allow_html=True)
@@ -1451,7 +1468,7 @@ def main():
             st.dataframe(kernel_info, hide_index=True, width='stretch')
         
         st.markdown('<div class="panel-header">SHORT-RUN DYNAMICS (MACRO Γ COEFFICIENTS)</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_coef_heatmap(gamma), use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(plot_coef_heatmap(gamma), width="stretch", config={'displayModeBar': False})
         
         # We removed the generic equation list in favor of the asset specific ones above
     
@@ -1512,7 +1529,7 @@ def main():
         st.markdown('<div class="panel-header">MACRO INDICATORS DATA (FRED-MD)</div>', unsafe_allow_html=True)
         st.dataframe(
             macro_data,
-            use_container_width=True,
+            width="stretch",
             height=400
         )
         
@@ -1524,7 +1541,7 @@ def main():
             st.markdown('<div style="font-family: \'IBM Plex Mono\'; font-size: 0.8rem; color: #888; margin-bottom: 0.5rem;">HISTORICAL PRICES</div>', unsafe_allow_html=True)
             st.dataframe(
                 asset_prices,
-                use_container_width=True,
+                width="stretch",
                 height=300
             )
             
@@ -1532,14 +1549,14 @@ def main():
             st.markdown('<div style="font-family: \'IBM Plex Mono\'; font-size: 0.8rem; color: #888; margin-bottom: 0.5rem;">LOG RETURNS</div>', unsafe_allow_html=True)
             st.dataframe(
                 asset_returns,
-                use_container_width=True,
+                width="stretch",
                 height=300
             )
         
         st.markdown('<div class="panel-header">KERNEL FEATURES (TRANSFORMED)</div>', unsafe_allow_html=True)
         st.dataframe(
             kernel_features,
-            use_container_width=True,
+            width="stretch",
             height=400
         )
     
