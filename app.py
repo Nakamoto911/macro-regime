@@ -1720,13 +1720,13 @@ def main():
                         
                         st.plotly_chart(
                             plot_fred_series(raw_data, f"RAW: {col}", "LEVEL DATA", is_transformed=False),
-                            use_container_width=True, config={'displayModeBar': False}
+                            width='stretch', config={'displayModeBar': False}
                         )
                     
                         t_label = get_transformation_label(tcode)
                         st.plotly_chart(
                             plot_fred_series(trans_data, f"TRANSFORMED: {col}", f"TCODE {tcode}: {t_label}", is_transformed=True),
-                            use_container_width=True, config={'displayModeBar': False}
+                            width='stretch', config={'displayModeBar': False}
                         )
         else:
             st.warning("Could not load full FRED-MD dataset.")
