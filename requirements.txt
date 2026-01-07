@@ -7,3 +7,5 @@ yahooquery>=2.4.1
 lxml>=6.0.0
 pandas-datareader>=0.10.0
 setuptools
+scikit-learn
+statsmodels
