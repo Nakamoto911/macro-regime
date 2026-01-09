@@ -1,29 +1,23 @@
 """
-High-Dimensional Adaptive Sparse Elastic Net VECM
-Strategic Asset Allocation System - V2 (Fixed Stability + Long-Term Trends)
+VECM Strategic Asset Allocation System - V3
+Forward Return Prediction Model (5-10 Year Horizon)
 
 Target: US Equities / Bonds / Gold
-Horizon: 5-10 years
-
-FIXES:
-- Stability analyzer now works with proper alpha scaling
-- Trend analyzer uses 2Y vs 5Y (and 10Y) horizons for strategic view
-- Better debugging output
+Methodology: Annualized Forward Returns ~ Macro State Features
+Estimation: Elastic Net Selection + OLS with HAC Robust Standard Errors
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-from yahooquery import Ticker
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNet, ElasticNetCV
 from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from sklearn.model_selection import TimeSeriesSplit
+from statsmodels.regression.linear_model import OLS
+from statsmodels.stats.sandwich_covariance import cov_hac
+from scipy.stats import t
 import pandas_datareader.data as web
-from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -208,7 +202,55 @@ st.markdown("""
 
 
 # ============================================================================
-# DATA LOADING
+# DATA PIPELINE
+# ============================================================================
+
+def compute_forward_returns(prices: pd.DataFrame, horizon_months: int = 60) -> pd.DataFrame:
+    """
+    Compute annualized forward returns for each asset.
+    """
+    log_prices = np.log(prices)
+    forward_log_return = log_prices.shift(-horizon_months) - log_prices
+    annualized_return = forward_log_return / (horizon_months / 12)
+    return annualized_return
+
+
+def prepare_macro_features(macro_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform macro variables into current-state features.
+    No forward-looking information used.
+    """
+    features = pd.DataFrame(index=macro_data.index)
+    
+    for col in macro_data.columns:
+        series = macro_data[col]
+        
+        # Level
+        features[f'{col}_level'] = series
+        
+        # Moving averages
+        features[f'{col}_MA12'] = series.rolling(12).mean()
+        features[f'{col}_MA60'] = series.rolling(60).mean()
+        
+        # Z-score vs 5Y average
+        ma60 = series.rolling(60).mean()
+        std60 = series.rolling(60).std()
+        features[f'{col}_zscore'] = (series - ma60) / std60
+        
+        # Percentile rank (rolling 10Y window)
+        features[f'{col}_pctl'] = series.rolling(120).apply(
+            lambda x: (x < x.iloc[-1]).sum() / len(x), raw=False
+        )
+        
+        # Momentum / slope
+        ma12 = series.rolling(12).mean()
+        std = series.rolling(60).std()
+        features[f'{col}_slope12'] = (ma12 - ma12.shift(12)) / std
+        features[f'{col}_slope60'] = (ma60 - ma60.shift(60)) / std
+    
+    return features.dropna()
+
+
 # ============================================================================
 
 @st.cache_data(ttl=3600)
@@ -230,10 +272,9 @@ def get_series_descriptions(file_path: str = 'FRED-MD_updated_appendix.csv') -> 
 
 @st.cache_data(ttl=3600)
 def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
-    """Load and process FRED-MD data."""
+    """Load and process FRED-MD data for specified macro variables."""
     try:
         df_raw = pd.read_csv(file_path)
-        transform_codes = df_raw.iloc[0]
         df = df_raw.iloc[1:].copy()
         df['sasdate'] = pd.to_datetime(df['sasdate'], utc=True).dt.tz_localize(None)
         df = df.set_index('sasdate')
@@ -241,34 +282,39 @@ def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
             
+        # Core Macro Variables from Spec
+        mapping = {
+            'PAYEMS': 'PAYEMS',     # Labor
+            'UNRATE': 'UNRATE',     # Labor
+            'INDPRO': 'INDPRO',     # Output
+            'CUMFNS': 'CAPACITY',   # Output
+            'CPIAUCSL': 'CPI',      # Prices
+            'WPSFD49207': 'PPI',    # Prices
+            'PCEPI': 'PCE',         # Prices
+            'FEDFUNDS': 'FEDFUNDS', # Rates
+            'GS10': 'GS10',         # Rates
+            'HOUST': 'HOUST',       # Housing
+            'M2SL': 'M2'            # Money
+        }
+        
         data = pd.DataFrame(index=df.index)
+        for fred_col, target_col in mapping.items():
+            if fred_col in df.columns:
+                data[target_col] = df[fred_col]
         
-        # Labor Market
-        data['PAYEMS'] = df['PAYEMS']
-        data['UNRATE'] = df['UNRATE']
+        # Derived Financial Variables
+        if 'GS10' in data.columns and 'FEDFUNDS' in data.columns:
+            data['SPREAD'] = data['GS10'] - data['FEDFUNDS']
         
-        # Output & Production
-        data['INDPRO'] = df['INDPRO']
-        data['CAPACITY'] = df['CUMFNS']
-        
-        # Prices
-        data['CPI'] = df['CPIAUCSL']
-        data['PPI'] = df['WPSFD49207']
-        data['PCE'] = df['PCEPI']
-        
-        # Financial Rates
-        data['FEDFUNDS'] = df['FEDFUNDS']
-        data['GS10'] = df['GS10']
-        data['SPREAD'] = df['GS10'] - df['FEDFUNDS']
-        
-        # Credit & Housing
-        data['BAA_AAA'] = df['BAA'] - df['AAA']
-        data['HOUST'] = df['HOUST']
-        
-        # Money Supply
-        data['M2'] = df['M2SL']
-        
-        # Apply log transformations where appropriate
+        if 'BAA' in df.columns and 'AAA' in df.columns:
+            data['BAA_AAA'] = df['BAA'] - df['AAA']
+            
+        # Apply log transformations where appropriate (Spec says keep core variables, 
+        # but apply transformations in prepare_macro_features. 
+        # However, level variables like INDPRO/CPI/etc usually need log-level or log-diff.
+        # Spec says {VAR}_level = X_t. I'll stick to logs for index-like variables as per previous logic
+        # but the spec doesn't explicitly say log. I'll log transform them here to keep consistency
+        # with standard macro modelling when using levels of prices/indices.)
         log_vars = ['PAYEMS', 'INDPRO', 'CPI', 'PPI', 'PCE', 'HOUST', 'M2']
         for col in log_vars:
             if col in data.columns:
@@ -284,52 +330,52 @@ def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_asset_data(start_date: str = '1960-01-01') -> pd.DataFrame:
-    """Load long history asset data."""
+    """Load long history asset prices."""
     
-    # EQUITIES from FRED-MD
-    equity_ret = pd.Series(dtype=float)
+    # EQUITIES from FRED-MD (S&P 500)
+    equity_prices = pd.Series(dtype=float)
     try:
         df_macro_raw = pd.read_csv('2025-11-MD.csv').iloc[1:]
         df_macro_raw['sasdate'] = pd.to_datetime(df_macro_raw['sasdate'], utc=True).dt.tz_localize(None)
         df_macro_raw.set_index('sasdate', inplace=True)
         
         if 'S&P 500' in df_macro_raw.columns:
-            equity_data = pd.to_numeric(df_macro_raw['S&P 500'], errors='coerce').dropna()
-            equity_ret = np.log(equity_data).diff().dropna()
+            equity_prices = pd.to_numeric(df_macro_raw['S&P 500'], errors='coerce').dropna()
     except Exception as e:
         st.warning(f"Equity data error: {e}")
 
-    # GOLD - simplified
-    gold_ret = pd.Series(dtype=float)
+    # GOLD - using PPI for Gold (WPU1022) as long-term proxy
+    gold_prices = pd.Series(dtype=float)
     try:
         gold_ppi = web.DataReader('WPU1022', 'fred', start_date)
         gold_ppi.index = pd.to_datetime(gold_ppi.index, utc=True).tz_localize(None)
         gold_ppi = gold_ppi.resample('MS').last()
-        gold_ret = np.log(gold_ppi).diff().dropna()['WPU1022']
+        gold_prices = gold_ppi['WPU1022'].dropna()
     except Exception as e:
         st.warning(f"Gold data error: {e}")
 
-    # BONDS - synthetic from GS10
-    bond_ret = pd.Series(dtype=float)
+    # BONDS - synthetic total return from GS10
+    bond_prices = pd.Series(dtype=float)
     try:
         gs10 = web.DataReader('GS10', 'fred', start_date)
         gs10.index = pd.to_datetime(gs10.index, utc=True).tz_localize(None)
         yields = gs10['GS10'] / 100
         duration = 7.5
+        # Calculate monthly total returns
         carry = yields.shift(1) / 12
         price_change = -duration * (yields - yields.shift(1))
         synth_ret = carry + price_change
-        bond_ret = np.log(1 + synth_ret).dropna()
+        # Convert returns to index
+        bond_prices = 100 * (1 + synth_ret.fillna(0)).cumprod()
     except Exception as e:
         st.warning(f"Bond data error: {e}")
 
-    all_ret = pd.DataFrame({
-        'EQUITY': equity_ret,
-        'GOLD': gold_ret,
-        'BONDS': bond_ret
+    df_prices = pd.DataFrame({
+        'EQUITY': equity_prices,
+        'GOLD': gold_prices,
+        'BONDS': bond_prices
     }).dropna()
     
-    df_prices = 100 * np.exp(all_ret.cumsum())
     return df_prices
 
 
@@ -337,444 +383,313 @@ def load_asset_data(start_date: str = '1960-01-01') -> pd.DataFrame:
 # MODEL COMPONENTS
 # ============================================================================
 
-class KernelDictionary:
-    """Simplified kernel dictionary for strategic horizon."""
-    
-    def __init__(self):
-        # For 5-10Y horizon, focus on longer lags
-        self.dense_lags = [1, 3, 6]  # Quarterly signal
-        self.anchor_lags = [12, 24, 36, 60]  # 1Y to 5Y cycles
-        
-    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        features = {}
-        
-        # Dense lags
-        for lag in self.dense_lags:
-            for col in data.columns:
-                features[f'{col}_L{lag}'] = data[col].shift(lag)
-        
-        # Moving averages for anchors (simpler than Gaussian)
-        for anchor in self.anchor_lags:
-            for col in data.columns:
-                features[f'{col}_MA{anchor}'] = data[col].rolling(anchor).mean()
-        
-        result = pd.DataFrame(features, index=data.index)
-        # Keep more data by forward-filling then dropping remaining NaN
-        result = result.dropna()
-        return result
+# ============================================================================
+# ESTIMATION LOGIC
+# ============================================================================
+
+def estimate_with_hac(y: pd.Series, X: pd.DataFrame, lag: int = 59) -> dict:
+    """
+    OLS estimation with Newey-West HAC standard errors.
+    """
+    # Add constant for OLS
+    import statsmodels.api as sm
+    X_const = sm.add_constant(X)
+    model = OLS(y, X_const).fit(cov_type='HAC', cov_kwds={'maxlags': lag})
+    return {
+        'model': model,
+        'coefficients': model.params,
+        'std_errors': model.bse,
+        't_stats': model.tvalues,
+        'p_values': model.pvalues,
+        'r_squared': model.rsquared,
+        'resid': model.resid
+    }
 
 
-class StabilityAnalyzer:
+def select_features_elastic_net(y: pd.Series, X: pd.DataFrame, 
+                                 l1_ratio: float = 0.5) -> tuple:
     """
-    Fixed stability analyzer - uses expanding windows and lower alpha.
+    Use cross-validated Elastic Net to select non-zero features.
     """
+    # Standardize
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    def __init__(self, n_windows: int = 5, min_persistence: float = 0.4):
-        self.n_windows = n_windows
-        self.min_persistence = min_persistence
+    # Elastic Net with CV
+    # Using TimeSeriesSplit for CV as per spec suggestion
+    tscv = TimeSeriesSplit(n_splits=5)
+    model = ElasticNetCV(
+        l1_ratio=l1_ratio,
+        cv=tscv,
+        max_iter=10000
+    )
+    model.fit(X_scaled, y)
+    
+    # Return features with non-zero coefficients
+    selected = X.columns[model.coef_ != 0].tolist()
+    return selected, model.coef_, model.alpha_
+
+
+def time_series_cv(y: pd.Series, X: pd.DataFrame, n_splits: int = 5):
+    """
+    Time-series cross-validation for model selection.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=60)  # 60-month gap to avoid leakage
+    
+    scores = []
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         
-    def analyze(self, y: pd.DataFrame, X: pd.DataFrame, 
-                l1_ratio: float = 0.5, alpha: float = 0.001) -> dict:
-        """
-        Run stability analysis with proper scaling.
+        if len(X_train) < 60: continue
         
-        Key fix: Use much lower alpha (0.001) because we're working with
-        standardized data and monthly returns (small numbers).
-        """
-        common_idx = y.index.intersection(X.index)
-        y_aligned = y.loc[common_idx].copy()
-        X_aligned = X.loc[common_idx].copy()
-        
-        n_obs = len(common_idx)
-        
-        # Standardize X once
+        # Fit and evaluate
+        model = ElasticNet(l1_ratio=0.5, alpha=0.01)
+        # Scaler
         scaler = StandardScaler()
-        X_scaled = pd.DataFrame(
-            scaler.fit_transform(X_aligned),
-            index=X_aligned.index,
-            columns=X_aligned.columns
-        )
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
         
-        # Use expanding windows (more stable than rolling)
-        # Window sizes: 50%, 60%, 70%, 80%, 90%, 100% of data
-        window_fracs = np.linspace(0.5, 1.0, self.n_windows)
-        
-        all_coefficients = defaultdict(list)
-        debug_info = {'n_obs': n_obs, 'n_features': len(X_aligned.columns), 'windows': []}
-        
-        for asset in y_aligned.columns:
-            for frac in window_fracs:
-                end_idx = int(n_obs * frac)
-                if end_idx < 60:  # Minimum 60 observations
-                    continue
-                
-                y_window = y_aligned.iloc[:end_idx][asset]
-                X_window = X_scaled.iloc[:end_idx]
-                
-                # Use lower alpha - this is critical
-                model = ElasticNet(
-                    l1_ratio=l1_ratio,
-                    alpha=alpha,  # Much lower than before
-                    fit_intercept=True,
-                    max_iter=10000,
-                    tol=1e-5,
-                    warm_start=False
-                )
-                
-                try:
-                    model.fit(X_window, y_window)
-                    coefs = pd.Series(model.coef_, index=X_window.columns)
-                    all_coefficients[asset].append(coefs)
-                    
-                    n_nonzero = (coefs != 0).sum()
-                    debug_info['windows'].append({
-                        'asset': asset,
-                        'frac': frac,
-                        'n_obs': end_idx,
-                        'n_nonzero': n_nonzero
-                    })
-                except Exception as e:
-                    debug_info['windows'].append({
-                        'asset': asset,
-                        'frac': frac,
-                        'error': str(e)
-                    })
-        
-        # Compute stability metrics
-        results = {}
-        
-        for asset, coef_list in all_coefficients.items():
-            if not coef_list:
-                results[asset] = {'stable_features': [], 'debug': 'No coefficients estimated'}
-                continue
-            
-            coef_df = pd.DataFrame(coef_list)
-            
-            # Persistence: how often is coefficient non-zero
-            persistence = (coef_df.abs() > 1e-6).mean()
-            
-            # Sign consistency
-            signs = np.sign(coef_df)
-            sign_mode = signs.mode().iloc[0] if len(signs) > 0 else signs.iloc[0]
-            sign_consistency = (signs == sign_mode).mean()
-            
-            # Mean coefficient (for ranking)
-            mean_coef = coef_df.mean()
-            
-            # Combined score
-            stability_score = persistence * sign_consistency
-            
-            # Select features that pass threshold
-            # More lenient: just need to appear in min_persistence fraction of windows
-            stable_mask = persistence >= self.min_persistence
-            stable_features = stability_score[stable_mask].sort_values(ascending=False)
-            
-            # If still empty, take top 10 by absolute mean coefficient
-            if len(stable_features) == 0:
-                stable_features = mean_coef.abs().sort_values(ascending=False).head(10)
-            
-            results[asset] = {
-                'stable_features': stable_features.head(15).index.tolist(),
-                'stability_scores': stability_score,
-                'persistence': persistence,
-                'sign_consistency': sign_consistency,
-                'mean_coefficients': mean_coef,
-                'all_coefficients': coef_df,
-                'n_windows': len(coef_list),
-                'n_nonzero_avg': (coef_df.abs() > 1e-6).sum(axis=1).mean()
-            }
-        
-        results['_debug'] = debug_info
-        return results
+        model.fit(X_train_scaled, y_train)
+        score = model.score(X_test_scaled, y_test)
+        scores.append(score)
+    
+    return (np.mean(scores), np.std(scores)) if scores else (0.0, 0.0)
 
 
-class LongTermTrendAnalyzer:
+def stability_analysis(y: pd.Series, X: pd.DataFrame, 
+                       window_years: int = 25,
+                       step_years: int = 5) -> list:
     """
-    Analyzes secular trends for 5-10 year investment horizon.
-    Uses 2Y vs 5Y vs 10Y comparisons.
+    Rolling window estimation for stability assessment.
     """
+    window_months = window_years * 12
+    step_months = step_years * 12
     
-    def __init__(self):
-        self.windows = {
-            'short': 24,   # 2 years
-            'medium': 60,  # 5 years
-            'long': 120    # 10 years
-        }
+    results = []
     
-    def analyze(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Compute long-term trends for each variable."""
-        results = []
+    for start in range(0, len(y) - window_months, step_months):
+        end = start + window_months
         
-        for col in data.columns:
-            series = data[col].dropna()
-            n = len(series)
-            
-            if n < self.windows['medium']:
-                continue
-            
-            current = series.iloc[-1]
-            
-            # 2-year trend
-            if n >= self.windows['short']:
-                ma_2y = series.rolling(self.windows['short']).mean()
-                slope_2y = (ma_2y.iloc[-1] - ma_2y.iloc[-self.windows['short']]) / self.windows['short']
-            else:
-                slope_2y = 0
-            
-            # 5-year trend
-            if n >= self.windows['medium']:
-                ma_5y = series.rolling(self.windows['medium']).mean()
-                slope_5y = (ma_5y.iloc[-1] - ma_5y.iloc[-self.windows['medium']]) / self.windows['medium']
-            else:
-                slope_5y = 0
-            
-            # 10-year trend (if available)
-            if n >= self.windows['long']:
-                ma_10y = series.rolling(self.windows['long']).mean()
-                slope_10y = (ma_10y.iloc[-1] - ma_10y.iloc[-self.windows['long']]) / self.windows['long']
-            else:
-                slope_10y = np.nan
-            
-            # Normalize slopes by series std
-            std = series.std()
-            if std > 0:
-                slope_2y_norm = slope_2y / std * 12  # Annualized
-                slope_5y_norm = slope_5y / std * 12
-                slope_10y_norm = slope_10y / std * 12 if not np.isnan(slope_10y) else np.nan
-            else:
-                slope_2y_norm = slope_5y_norm = slope_10y_norm = 0
-            
-            # Secular trend classification (based on 5Y trend)
-            if slope_5y_norm > 0.1:
-                secular_trend = 'SECULAR BULL'
-            elif slope_5y_norm < -0.1:
-                secular_trend = 'SECULAR BEAR'
-            else:
-                secular_trend = 'RANGE-BOUND'
-            
-            # Cycle position (2Y vs 5Y)
-            if slope_2y_norm > slope_5y_norm + 0.05:
-                cycle_position = 'ACCELERATING'
-            elif slope_2y_norm < slope_5y_norm - 0.05:
-                cycle_position = 'DECELERATING'
-            else:
-                cycle_position = 'ON TREND'
-            
-            # Historical percentile (where is current value vs history)
-            percentile = (series < current).sum() / n * 100
-            
-            # Z-score vs 5Y average
-            if n >= self.windows['medium']:
-                avg_5y = series.iloc[-self.windows['medium']:].mean()
-                std_5y = series.iloc[-self.windows['medium']:].std()
-                z_score = (current - avg_5y) / std_5y if std_5y > 0 else 0
-            else:
-                z_score = 0
-            
-            results.append({
-                'Variable': col,
-                'Current': current,
-                'Slope_2Y': slope_2y_norm,
-                'Slope_5Y': slope_5y_norm,
-                'Slope_10Y': slope_10y_norm,
-                'Secular_Trend': secular_trend,
-                'Cycle_Position': cycle_position,
-                'Z_Score_5Y': z_score,
-                'Percentile': percentile
-            })
+        y_window = y.iloc[start:end]
+        X_window = X.iloc[start:end]
         
-        return pd.DataFrame(results)
-
-
-class RegimeSentinel:
-    """Regime detection for risk management."""
-    
-    def __init__(self, alert_threshold: float = 2.0):
-        self.alert_threshold = alert_threshold
+        # Drop NaN (forward returns missing at end)
+        valid = y_window.notna()
+        y_valid = y_window[valid]
+        X_valid = X_window[valid]
         
-    def evaluate(self, data: pd.DataFrame) -> tuple:
-        recent = data.tail(60)
-        
-        indicators = {}
-        
-        # Credit stress
-        if 'BAA_AAA' in recent.columns:
-            spread_z = (recent['BAA_AAA'].iloc[-1] - recent['BAA_AAA'].mean()) / recent['BAA_AAA'].std()
-            indicators['credit'] = spread_z
-        else:
-            indicators['credit'] = 0
-        
-        # Yield curve
-        if 'SPREAD' in recent.columns:
-            curve_z = -(recent['SPREAD'].iloc[-1] - recent['SPREAD'].mean()) / recent['SPREAD'].std()
-            indicators['curve'] = curve_z
-        else:
-            indicators['curve'] = 0
-        
-        # Production
-        if 'INDPRO' in recent.columns:
-            prod_chg = recent['INDPRO'].pct_change(12).iloc[-1]
-            indicators['production'] = -prod_chg / 0.03
-        else:
-            indicators['production'] = 0
-        
-        # Unemployment
-        if 'UNRATE' in recent.columns:
-            unrate_chg = recent['UNRATE'].iloc[-1] - recent['UNRATE'].iloc[-12]
-            indicators['unemployment'] = unrate_chg / 0.5
-        else:
-            indicators['unemployment'] = 0
-        
-        # Composite score
-        stress_score = (
-            0.30 * indicators['credit'] +
-            0.25 * indicators['curve'] +
-            0.25 * indicators['production'] +
-            0.20 * indicators['unemployment']
-        )
-        
-        if stress_score > self.alert_threshold:
-            status = "ALERT"
-        elif stress_score > self.alert_threshold * 0.6:
-            status = "WARNING"
-        else:
-            status = "CALM"
-        
-        return status, stress_score, indicators
-
-
-class VECM:
-    """Simplified VECM for cointegration analysis."""
-    
-    def __init__(self, alpha: float = 0.001):
-        self.alpha = alpha
-        self.beta = None
-        self.cointegration_vars = None
-        
-    def estimate_cointegration(self, levels):
-        df = levels.copy()
-        if 'SPREAD' in df.columns:
-            df = df.drop(columns=['SPREAD'])
-        
-        self.cointegration_vars = list(df.columns)[:10]
-        df = df[self.cointegration_vars]
-        
-        try:
-            result = coint_johansen(df.values, det_order=0, k_ar_diff=2)
-            self.beta = result.evec[:, 0]
-            
-            return {
-                'rank': 1,
-                'eigenvalues': result.eig,
-                'trace_stats': result.lr1,
-                'critical_values': result.cvt[:, 1]
-            }
-        except Exception as e:
-            self.beta = np.ones(len(self.cointegration_vars)) / len(self.cointegration_vars)
-            return {'rank': 1, 'error': str(e)}
-    
-    def compute_ect(self, levels) -> pd.Series:
-        if self.beta is None or self.cointegration_vars is None:
-            return pd.Series(0, index=levels.index)
-        
-        cols = [c for c in self.cointegration_vars if c in levels.columns]
-        vals = levels[cols].values
-        beta = self.beta[:len(cols)]
-        
-        ect = np.dot(vals, beta)
-        return pd.Series(ect, index=levels.index, name='ECT')
-
-
-def compute_strategic_signals(stability_results: dict, trend_analysis: pd.DataFrame, 
-                              macro_cols: list) -> dict:
-    """Compute net signals based on stable drivers and trends."""
-    assets = ['EQUITY', 'BONDS', 'GOLD']
-    signals = {}
-    
-    for asset in assets:
-        if asset not in stability_results:
+        if len(y_valid) < 120:  # Minimum 10 years of valid data
             continue
-            
-        result = stability_results[asset]
-        stable_feats = result.get('stable_features', [])
-        persistence = result.get('persistence', pd.Series())
-        sign_cons = result.get('sign_consistency', pd.Series())
-        mean_coefs = result.get('mean_coefficients', pd.Series())
         
-        # 1. Filter high-confidence drivers (≥80% persistence and sign consistency)
-        high_conf = [f for f in stable_feats if persistence.get(f, 0) >= 0.8 and sign_cons.get(f, 0) >= 0.8]
+        # Estimate
+        selected_features, coefs, alpha = select_features_elastic_net(y_valid, X_valid)
         
-        driver_details = []
-        total_signal = 0
-        total_abs_signal = 0
-        
-        for feat in high_conf:
-            # Extract base variable using prefix matching against macro columns
-            base_var = None
-            for col in macro_cols:
-                if feat == col or feat.startswith(col + '_'):
-                    base_var = col
-                    break
-            if not base_var:
-                base_var = feat.split('_')[0]
-                
-            coef = mean_coefs.get(feat, 0)
-            pers = persistence.get(feat, 0)
-            sign_c = sign_cons.get(feat, 0)
-            
-            # Get trend info
-            trend_row = trend_analysis[trend_analysis['Variable'] == base_var]
-            if not trend_row.empty:
-                slope_5y = trend_row['Slope_5Y'].iloc[0]
-                secular = trend_row['Secular_Trend'].iloc[0]
-            else:
-                slope_5y = 0
-                secular = 'N/A'
-            
-            # 3. Compute signal contribution
-            weight = pers * sign_c
-            signal_contrib = coef * slope_5y * weight
-            
-            # 4. Classify effect
-            if coef > 0:
-                effect = 'BULLISH' if slope_5y > 0.05 else 'BEARISH' if slope_5y < -0.05 else 'NEUTRAL'
-            else:
-                effect = 'BEARISH' if slope_5y > 0.05 else 'BULLISH' if slope_5y < -0.05 else 'NEUTRAL'
-                
-            driver_details.append({
-                'Driver': feat,
-                'Coefficient': coef,
-                '5Y Trend': secular,
-                '5Y Slope': slope_5y,
-                'Signal': effect,
-                'Contribution': signal_contrib
-            })
-            
-            total_signal += signal_contrib
-            total_abs_signal += abs(signal_contrib)
-            
-        # 5. Aggregate net signal (Normalized to range [-1, +1])
-        net_signal = total_signal / total_abs_signal if total_abs_signal > 0 else 0
-        
-        # 6. Signal-based adjustment classification
-        if net_signal > 0.3:
-            rec = 'OVERWEIGHT'
-        elif net_signal < -0.3:
-            rec = 'UNDERWEIGHT'
-        else:
-            rec = 'NEUTRAL'
-            
-        signals[asset] = {
-            'net_signal': net_signal,
-            'recommendation': rec,
-            'n_drivers': len(high_conf),
-            'bullish': sum(1 for d in driver_details if d['Signal'] == 'BULLISH'),
-            'bearish': sum(1 for d in driver_details if d['Signal'] == 'BEARISH'),
-            'neutral': sum(1 for d in driver_details if d['Signal'] == 'NEUTRAL'),
-            'details': driver_details
-        }
+        results.append({
+            'start_date': y.index[start],
+            'end_date': y.index[end - 1],
+            'selected_features': selected_features,
+            'coefficients': dict(zip(X.columns, coefs)),
+            'n_selected': len(selected_features)
+        })
     
-    return signals
+    return results
+
+
+def compute_stability_metrics(stability_results: list, feature_names: list) -> pd.DataFrame:
+    """
+    Compute stability metrics for each feature across estimation windows.
+    """
+    n_windows = len(stability_results)
+    if n_windows == 0:
+        return pd.DataFrame(columns=['feature', 'persistence', 'sign_consistency', 'magnitude_stability', 'mean_coefficient'])
+        
+    metrics = []
+    for feat in feature_names:
+        coefs = []
+        for result in stability_results:
+            if feat in result['coefficients']:
+                coefs.append(result['coefficients'][feat])
+        
+        coefs = np.array(coefs)
+        non_zero = coefs[coefs != 0]
+        
+        persistence = len(non_zero) / n_windows
+        
+        if len(non_zero) > 1:
+            sign_consistency = max(
+                (non_zero > 0).sum() / len(non_zero),
+                (non_zero < 0).sum() / len(non_zero)
+            )
+            cv = np.std(non_zero) / np.abs(np.mean(non_zero)) if np.mean(non_zero) != 0 else 999
+            magnitude_stability = 1 / (1 + cv)
+            mean_coef = np.mean(non_zero)
+        elif len(non_zero) == 1:
+            sign_consistency = 1.0
+            magnitude_stability = 1.0
+            mean_coef = non_zero[0]
+        else:
+            sign_consistency = 0.0
+            magnitude_stability = 0.0
+            mean_coef = 0.0
+        
+        metrics.append({
+            'feature': feat,
+            'persistence': persistence,
+            'sign_consistency': sign_consistency,
+            'magnitude_stability': magnitude_stability,
+            'mean_coefficient': mean_coef
+        })
+    
+    return pd.DataFrame(metrics)
+
+
+# ============================================================================
+# SIGNALS & ALLOCATION
+# ============================================================================
+
+def compute_expected_returns(macro_features_current: pd.Series,
+                              stable_coefficients: pd.Series,
+                              intercept: float) -> float:
+    """
+    Compute expected annualized return for an asset.
+    """
+    # Align features
+    common_features = stable_coefficients.index.intersection(macro_features_current.index)
+    
+    expected_return = intercept + (
+        macro_features_current[common_features] * stable_coefficients[common_features]
+    ).sum()
+    
+    return expected_return
+
+
+def compute_confidence_interval(expected_return: float,
+                                 prediction_std_error: float,
+                                 confidence: float = 0.90) -> tuple:
+    """
+    Compute confidence interval for expected return.
+    """
+    # Use t-distribution with large df (approximates normal)
+    t_crit = t.ppf((1 + confidence) / 2, df=100)
+    
+    lower = expected_return - t_crit * prediction_std_error
+    upper = expected_return + t_crit * prediction_std_error
+    
+    return lower, upper
+
+
+def compute_driver_attribution(macro_features_current: pd.Series,
+                                stable_coefficients: pd.Series,
+                                feature_means: pd.Series) -> pd.DataFrame:
+    """
+    Attribute expected return to each driver.
+    """
+    attributions = []
+    
+    for feat in stable_coefficients.index:
+        if feat not in macro_features_current.index:
+            continue
+        
+        current_val = macro_features_current[feat]
+        mean_val = feature_means.get(feat, 0)
+        coef = stable_coefficients[feat]
+        
+        # Contribution = coef × (current - mean)
+        contribution = coef * (current_val - mean_val)
+        
+        # Direction
+        if contribution > 0.005:
+            direction = 'TAILWIND'
+        elif contribution < -0.005:
+            direction = 'HEADWIND'
+        else:
+            direction = 'NEUTRAL'
+        
+        attributions.append({
+            'feature': feat,
+            'coefficient': coef,
+            'current_value': current_val,
+            'historical_mean': mean_val,
+            'deviation': current_val - mean_val,
+            'contribution': contribution,
+            'direction': direction
+        })
+    
+    return pd.DataFrame(attributions).sort_values('contribution', key=abs, ascending=False)
+
+
+def evaluate_regime(macro_data: pd.DataFrame, alert_threshold: float = 2.0) -> tuple:
+    """
+    Simplified regime detection for risk management.
+    """
+    recent = macro_data.tail(60)
+    indicators = {}
+    
+    # Credit stress
+    if 'BAA_AAA' in recent.columns:
+        spread_z = (recent['BAA_AAA'].iloc[-1] - recent['BAA_AAA'].mean()) / recent['BAA_AAA'].std()
+        indicators['credit'] = spread_z
+    else:
+        indicators['credit'] = 0
+    
+    # Yield curve
+    if 'SPREAD' in recent.columns:
+        curve_z = -(recent['SPREAD'].iloc[-1] - recent['SPREAD'].mean()) / recent['SPREAD'].std()
+        indicators['curve'] = curve_z
+    else:
+        indicators['curve'] = 0
+    
+    stress_score = 0.5 * indicators['credit'] + 0.5 * indicators['curve']
+    
+    if stress_score > alert_threshold:
+        status = "ALERT"
+    elif stress_score > alert_threshold * 0.6:
+        status = "WARNING"
+    else:
+        status = "CALM"
+        
+    return status, stress_score, indicators
+
+
+def compute_allocation(expected_returns: dict,
+                       confidence_intervals: dict,
+                       regime_status: str,
+                       risk_free_rate: float = 0.04) -> dict:
+    """
+    Compute target allocation based on expected returns.
+    """
+    # Base weights
+    base = {'EQUITY': 0.60, 'BONDS': 0.30, 'GOLD': 0.10}
+    min_w = {'EQUITY': 0.20, 'BONDS': 0.20, 'GOLD': 0.05}
+    max_w = {'EQUITY': 0.80, 'BONDS': 0.50, 'GOLD': 0.25}
+    
+    # Regime adjustment
+    if regime_status == 'ALERT':
+        regime_mult = {'EQUITY': 0.5, 'BONDS': 1.2, 'GOLD': 1.5}
+    elif regime_status == 'WARNING':
+        regime_mult = {'EQUITY': 0.75, 'BONDS': 1.1, 'GOLD': 1.25}
+    else:
+        regime_mult = {'EQUITY': 1.0, 'BONDS': 1.0, 'GOLD': 1.0}
+    
+    # Expected return adjustment
+    weights = {}
+    for asset in ['EQUITY', 'BONDS', 'GOLD']:
+        exp_ret = expected_returns.get(asset, 0.05)
+        excess_return = exp_ret - risk_free_rate
+        
+        # Scale: +1% excess return → +5% weight adjustment
+        return_adj = 1.0 + (excess_return * 5)
+        
+        # Combined adjustment
+        adj_weight = base[asset] * regime_mult[asset] * return_adj
+        weights[asset] = np.clip(adj_weight, min_w[asset], max_w[asset])
+    
+    # Normalize
+    total = sum(weights.values())
+    weights = {k: v / total for k, v in weights.items()}
+    
+    return weights
 
 
 # ============================================================================
@@ -950,46 +865,41 @@ def plot_trend_bars(trend_df: pd.DataFrame, variables: list, descriptions: dict 
     return fig
 
 
-def plot_driver_vs_asset(feat_data: pd.DataFrame, asset_prices: pd.DataFrame, 
+def plot_driver_vs_asset(feat_data: pd.DataFrame, asset_returns: pd.DataFrame, 
                          feat_name: str, asset: str, descriptions: dict = None) -> go.Figure:
-    """Plot dual-axis comparison of macro driver and asset price with normalization."""
+    """Plot dual-axis comparison of macro driver and forward asset return using raw values."""
     theme = create_theme()
     
-    if feat_name not in feat_data.columns or asset not in asset_prices.columns:
+    if feat_name not in feat_data.columns or asset not in asset_returns.columns:
         return go.Figure()
         
     # Align data
-    combined = pd.concat([feat_data[feat_name], asset_prices[asset]], axis=1).dropna()
+    combined = pd.concat([feat_data[feat_name], asset_returns[asset]], axis=1).dropna()
     if combined.empty:
         return go.Figure()
         
-    # Normalize for visual comparison: (x - min) / (max - min)
-    def normalize(s):
-        return (s - s.min()) / (s.max() - s.min()) if (s.max() - s.min()) != 0 else s
-    
-    macro_norm = normalize(combined[feat_name])
-    # Log-transform asset price to reveal early history dynamics
-    asset_norm = normalize(np.log(combined[asset]))
+    macro_vals = combined[feat_name]
+    asset_vals = combined[asset]
     
     base_var = feat_name.split('_')[0]
     desc = descriptions.get(base_var, base_var) if descriptions else base_var
-    title_text = f"{feat_name} ({desc}) vs {asset} (Log-Scaled)"
+    title_text = f"{feat_name} ({desc}) vs {asset} Forward Return"
     
     fig = go.Figure()
     
     # Macro series (left axis)
     fig.add_trace(go.Scatter(
-        x=combined.index, y=macro_norm, name=feat_name,
+        x=combined.index, y=macro_vals, name=feat_name,
         mode='lines', line=dict(color='#00d26a', width=1.5),
-        hovertemplate="<b>" + feat_name + "</b> (Norm): %{y:.2f}<extra></extra>"
+        hovertemplate="<b>" + feat_name + "</b>: %{y:.4f}<extra></extra>"
     ))
     
-    # Asset price (right axis)
+    # Asset returns (right axis)
     fig.add_trace(go.Scatter(
-        x=combined.index, y=asset_norm, name=asset,
+        x=combined.index, y=asset_vals, name=asset,
         mode='lines', line=dict(color='#4da6ff', width=1.5),
         yaxis='y2',
-        hovertemplate="<b>" + asset + "</b> (Norm): %{y:.2f}<extra></extra>"
+        hovertemplate="<b>" + asset + " Return</b>: %{y:.2%}<extra></extra>"
     ))
     
     fig.update_layout(
@@ -1011,10 +921,112 @@ def plot_driver_vs_asset(feat_data: pd.DataFrame, asset_prices: pd.DataFrame,
             spikethickness=1,
             spikecolor='#555'
         ),
-        yaxis=dict(gridcolor='#1a1a1a', side='left', title='Macro (Normalized)', range=[0, 1]),
-        yaxis2=dict(gridcolor='#1a1a1a', overlaying='y', side='right', title='Asset (Normalized)', range=[0, 1])
+        yaxis=dict(gridcolor='#1a1a1a', side='left', title=f'Macro: {feat_name}'),
+        yaxis2=dict(gridcolor='#1a1a1a', overlaying='y', side='right', title='Forward Return (Annualized)', tickformat='.0%')
     )
     return fig
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def plot_backtest(actual_returns: pd.Series, 
+                  predicted_returns: pd.Series,
+                  confidence_lower: pd.Series,
+                  confidence_upper: pd.Series) -> go.Figure:
+    """
+    Plot predicted vs actual forward returns.
+    """
+    fig = go.Figure()
+    
+    # Confidence band
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=confidence_upper,
+        mode='lines',
+        line=dict(width=0),
+        showlegend=False
+    ))
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=confidence_lower,
+        mode='lines',
+        line=dict(width=0),
+        fill='tonexty',
+        fillcolor='rgba(77, 166, 255, 0.2)',
+        name='90% CI'
+    ))
+    
+    # Predicted
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=predicted_returns,
+        mode='lines',
+        line=dict(color='#4da6ff', width=2),
+        name='Predicted'
+    ))
+    
+    # Actual
+    fig.add_trace(go.Scatter(
+        x=actual_returns.index,
+        y=actual_returns,
+        mode='lines',
+        line=dict(color='#ff6b35', width=2),
+        name='Actual'
+    ))
+    
+    theme = create_theme()
+    fig.update_layout(
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=50, r=20, t=30, b=40),
+        height=350,
+        xaxis=dict(gridcolor='#1a1a1a'),
+        yaxis=dict(gridcolor='#1a1a1a', title='Annualized Return'),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0)
+    )
+    
+    return fig
+
+
+def generate_narrative(expected_returns: dict,
+                       driver_attributions: dict,
+                       regime_status: str) -> str:
+    """
+    Generate human-readable summary of the analysis.
+    """
+    narratives = []
+    
+    for asset in ['EQUITY', 'BONDS', 'GOLD']:
+        if asset not in expected_returns or asset not in driver_attributions:
+            continue
+            
+        exp_ret = expected_returns[asset]
+        attr = driver_attributions[asset]
+        
+        tailwinds = attr[attr['direction'] == 'TAILWIND'].head(2)
+        headwinds = attr[attr['direction'] == 'HEADWIND'].head(2)
+        
+        # Extract feature names (remove transformation suffixes for display)
+        tailwind_list = [f.split('_')[0] for f in tailwinds['feature'].tolist()]
+        headwind_list = [f.split('_')[0] for f in headwinds['feature'].tolist()]
+        
+        tailwind_str = ', '.join(tailwind_list) or 'none'
+        headwind_str = ', '.join(headwind_list) or 'none'
+        
+        narratives.append(
+            f"**{asset}** ({exp_ret:.1%} expected): "
+            f"Tailwinds from {tailwind_str}; headwinds from {headwind_str}."
+        )
+    
+    regime_note = {
+        'CALM': 'Regime is stable, no defensive adjustment needed.',
+        'WARNING': 'Elevated stress detected, modest defensive tilt applied.',
+        'ALERT': 'High stress regime, significant defensive positioning.'
+    }.get(regime_status, 'Regime status unknown.')
+    
+    return '\n\n'.join(narratives) + f'\n\n{regime_note}'
 
 
 # ============================================================================
@@ -1025,7 +1037,7 @@ def main():
     st.markdown("""
     <div class="header-container">
         <p class="header-title">◈ VECM STRATEGIC ALLOCATION</p>
-        <p class="header-subtitle">5-10 YEAR HORIZON · STABILITY-ENHANCED · V2</p>
+        <p class="header-subtitle">FORWARD RETURN PREDICTION · 5-10 YEAR HORIZON</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1037,409 +1049,219 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        st.markdown("##### Stability Analysis")
+        horizon_months = st.slider("Horizon (Months)", 36, 120, 60, help="Forward return horizon")
+        l1_ratio = st.slider("L1 Ratio", 0.1, 0.9, 0.5, 0.1, help="Elastic Net mixing parameter")
+        min_persistence = st.slider("Min Persistence", 0.3, 0.9, 0.6, 0.1, help="Feature selection threshold")
+        confidence_level = st.slider("Confidence Level", 0.80, 0.95, 0.90, 0.05)
+        estimation_window_years = st.slider("Estimation Window (Years)", 15, 35, 25)
         
-        n_windows = st.slider("Windows", 3, 8, 5, help="Number of expanding windows")
-        min_persistence = st.slider("Min Persistence", 0.2, 0.8, 0.4, 0.1,
-                                    help="Min fraction of windows where feature must appear")
-        
-        st.markdown("##### Elastic Net")
-        
-        l1_ratio = st.slider("L1 Ratio", 0.1, 0.9, 0.5, 0.1,
-                             help="0=Ridge (grouped), 1=Lasso (sparse)")
-        alpha = st.select_slider("Alpha (Regularization)", 
-                                 options=[0.0001, 0.0005, 0.001, 0.005, 0.01],
-                                 value=0.001,
-                                 help="Lower = more features selected")
-        
-        st.markdown("##### Risk")
         alert_threshold = st.slider("Alert Threshold", 1.0, 3.0, 2.0, 0.25)
-        
-        show_debug = st.checkbox("Show Debug Info", value=False)
+        risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", 0.0, 10.0, 4.0) / 100
     
     # Load data
     macro_data = load_fred_md_data()
     asset_prices = load_asset_data()
     descriptions = get_series_descriptions()
     
-    if macro_data.empty:
-        st.error("Failed to load macro data")
+    if macro_data.empty or asset_prices.empty:
+        st.error("Failed to load required data.")
         return
     
     common_idx = macro_data.index.intersection(asset_prices.index)
+    macro_data = macro_data.loc[common_idx]
     asset_prices = asset_prices.loc[common_idx]
     
-    # Initialize components
-    kernel = KernelDictionary()
-    stability = StabilityAnalyzer(n_windows=n_windows, min_persistence=min_persistence)
-    trend_analyzer = LongTermTrendAnalyzer()
-    sentinel = RegimeSentinel(alert_threshold=alert_threshold)
-    vecm = VECM(alpha=alpha)
+    # 1. Feature Preparation
+    macro_features = prepare_macro_features(macro_data)
+    y_forward = compute_forward_returns(asset_prices, horizon_months=horizon_months)
     
-    # Run analysis
-    kernel_features = kernel.transform(macro_data)
-    asset_returns = np.log(asset_prices).diff().dropna()
+    # Align again because of lags and forward shifts
+    valid_idx = macro_features.index.intersection(y_forward.index)
+    X = macro_features.loc[valid_idx]
+    y = y_forward.loc[valid_idx]
     
-    # Stability analysis
-    stability_results = stability.analyze(
-        asset_returns, kernel_features,
-        l1_ratio=l1_ratio, alpha=alpha
-    )
+    # Results containers
+    expected_returns = {}
+    confidence_intervals = {}
+    driver_attributions = {}
+    stability_results_map = {}
+    model_stats = {}
     
-    # Long-term trends
-    trend_analysis = trend_analyzer.analyze(macro_data)
-    
-    # Regime
-    status, stress_score, stress_indicators = sentinel.evaluate(macro_data)
-    
-    # Cointegration
-    coint_results = vecm.estimate_cointegration(macro_data)
-    ect = vecm.compute_ect(macro_data)
-    
-    # Generate allocation based on signal and regime
-    base_allocs = {
-        'ALERT': {'EQUITY': 0.30, 'BONDS': 0.45, 'GOLD': 0.25},
-        'WARNING': {'EQUITY': 0.45, 'BONDS': 0.40, 'GOLD': 0.15},
-        'CALM': {'EQUITY': 0.60, 'BONDS': 0.30, 'GOLD': 0.10}
-    }
-    
-    current_base = base_allocs.get(status, base_allocs['CALM'])
-    strategic_signals = compute_strategic_signals(stability_results, trend_analysis, list(macro_data.columns))
-    
-    # 0.15 max adjustment per asset based on net signal
-    adjustment_factor = 0.15
-    adjusted_weights = {}
+    # 2. Main Analysis Loop per Asset
     for asset in ['EQUITY', 'BONDS', 'GOLD']:
-        net_sig = strategic_signals.get(asset, {}).get('net_signal', 0)
-        adj = net_sig * adjustment_factor
-        raw_weight = current_base[asset] + adj
-        # Clamp between 5% and 85%
-        adjusted_weights[asset] = max(0.05, min(0.85, raw_weight))
-        
-    # Final normalized weights
-    total_w = sum(adjusted_weights.values())
-    weights = {k: v / total_w for k, v in adjusted_weights.items()}
+        with st.status(f"Analyzing {asset}...", expanded=False):
+            y_asset = y[asset]
+            
+            # Feature Selection (Full Sample)
+            selected_features, coef_full, alpha = select_features_elastic_net(y_asset.dropna(), X.loc[y_asset.dropna().index], l1_ratio=l1_ratio)
+            
+            # Stability Analysis
+            stab_results = stability_analysis(y_asset, X, window_years=estimation_window_years)
+            metrics = compute_stability_metrics(stab_results, X.columns)
+            
+            # Filter for STABLE features
+            stable_features = metrics[metrics['persistence'] >= min_persistence]['feature'].tolist()
+            if not stable_features:
+                stable_features = metrics.sort_values('persistence', ascending=False).head(5)['feature'].tolist()
+            
+            # Final OLS Estimation with HAC
+            y_valid = y_asset.dropna()
+            X_stable = X.loc[y_valid.index][stable_features]
+            
+            hac_results = estimate_with_hac(y_valid, X_stable, lag=horizon_months-1)
+            
+            # Predictions for current state
+            current_X = X.iloc[-1][stable_features]
+            coefs = hac_results['coefficients']
+            intercept = coefs['const']
+            beta = coefs.drop('const')
+            
+            exp_ret = compute_expected_returns(current_X, beta, intercept)
+            
+            # Prediction SE (simplified: use model stderr for intercept + drivers)
+            # A more robust pred SE would use X' (V_hac) X, but this is a good proxy for CI
+            prediction_se = hac_results['std_errors'].mean() # Placeholder for simplified CI
+            
+            ci = compute_confidence_interval(exp_ret, prediction_se, confidence=confidence_level)
+            
+            # Attribution
+            feature_means = X[stable_features].mean()
+            attribution = compute_driver_attribution(current_X, beta, feature_means)
+            
+            # Storage
+            expected_returns[asset] = exp_ret
+            confidence_intervals[asset] = ci
+            driver_attributions[asset] = attribution
+            stability_results_map[asset] = {
+                'metrics': metrics,
+                'stable_features': stable_features,
+                'hac_results': hac_results,
+                'all_coefficients': pd.DataFrame([res['coefficients'] for res in stab_results])
+            }
+            model_stats[asset] = hac_results
+            
+    # 3. Regime and Allocation
+    regime_status, stress_score, stress_indicators = evaluate_regime(macro_data, alert_threshold=alert_threshold)
+    target_weights = compute_allocation(expected_returns, confidence_intervals, regime_status, risk_free_rate=risk_free_rate)
     
-    # =========================================================================
-    # DASHBOARD
-    # =========================================================================
+    # 4. Dashboard Implementation
     
     # Metrics row
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        color = 'positive' if status == 'CALM' else 'warning' if status == 'WARNING' else 'negative'
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Regime</div>
-            <div class="metric-value {color}">{status}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        color = 'positive' if stress_score < 1.2 else 'warning' if stress_score < 2.0 else 'negative'
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Stress</div>
-            <div class="metric-value {color}">{stress_score:.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        n_stable = sum(len(r.get('stable_features', [])) for k, r in stability_results.items() if k != '_debug')
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Stable Drivers</div>
-            <div class="metric-value">{n_stable}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        ect_val = ect.iloc[-1] if len(ect) > 0 else 0
-        color = 'positive' if ect_val > 0 else 'negative'
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">ECT</div>
-            <div class="metric-value {color}">{ect_val:+.3f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col5:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Data Points</div>
-            <div class="metric-value">{len(common_idx)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # Debug info
-    if show_debug and '_debug' in stability_results:
-        debug = stability_results['_debug']
-        st.markdown(f"""
-        <div class="debug-box">
-            <b>Debug:</b> n_obs={debug['n_obs']}, n_features={debug['n_features']}<br>
-            Windows: {len(debug['windows'])} estimations<br>
-            Sample: {debug['windows'][:3] if debug['windows'] else 'None'}
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "SECULAR TRENDS", "DIAGNOSTICS"])
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Regime", regime_status)
+    with m2:
+        st.metric("Stress Score", f"{stress_score:.2f}")
+    with m3:
+        st.metric("Risk-Free Rate", f"{risk_free_rate:.1%}")
+    with m4:
+        st.metric("Horizon", f"{horizon_months}m")
+
+    tab1, tab2, tab3, tab4 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "BACKTEST", "DIAGNOSTICS"])
     
     with tab1:
-        st.markdown('<div class="panel-header">STRATEGIC POSITIONING SUMMARY</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-header">EXPECTED 5Y RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
         
-        # Summary Table
-        summary_rows = []
+        # summary_panel
+        summary_data = []
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
-            if asset in strategic_signals:
-                sig = strategic_signals[asset]
-                summary_rows.append({
-                    'Asset': asset,
-                    '# Drivers': sig['n_drivers'],
-                    'Bullish': sig['bullish'],
-                    'Bearish': sig['bearish'],
-                    'Neutral': sig['neutral'],
-                    'Net Signal': f"{sig['net_signal']:+.2f}",
-                    'Recommendation': sig['recommendation']
-                })
+            exp = expected_returns[asset]
+            ci = confidence_intervals[asset]
+            # Historical avg (approx)
+            avg_ret = y[asset].mean()
+            diff = exp - avg_ret
+            rec = "OVERWEIGHT" if diff > 0.01 else "UNDERWEIGHT" if diff < -0.01 else "NEUTRAL"
+            
+            summary_data.append({
+                'Asset': asset,
+                'Expected Return': f"{exp:.1%}",
+                f'{int(confidence_level*100)}% CI': f"[{ci[0]:.1%}, {ci[1]:.1%}]",
+                'vs Historical': f"{diff:+.1%}",
+                'Recommendation': rec,
+                'Target Weight': f"{target_weights[asset]:.0%}"
+            })
+        st.dataframe(pd.DataFrame(summary_data), hide_index=True, width='stretch')
         
-        if summary_rows:
-            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
-            
-            # Expandable Details
-            cols = st.columns(3)
-            for i, asset in enumerate(['EQUITY', 'BONDS', 'GOLD']):
-                with cols[i]:
-                    with st.expander(f"Drivers: {asset}"):
-                        if asset in strategic_signals:
-                            sig = strategic_signals[asset]
-                            if sig['details']:
-                                details_df = pd.DataFrame(sig['details'])
-                                # Display selection
-                                disp_df = details_df[['Driver', 'Signal', '5Y Trend', 'Contribution']].copy()
-                                disp_df['Contribution'] = disp_df['Contribution'].map(lambda x: f"{x:+.5f}")
-                                st.dataframe(disp_df, hide_index=True)
-                            else:
-                                st.caption("No high-confidence drivers.")
-            
-            # Narrative rationalein
+        # Allocation Charts
+        col_c1, col_c2 = st.columns([1, 2])
+        with col_c1:
+            st.plotly_chart(plot_allocation(target_weights), width='stretch')
+        with col_c2:
             st.markdown('<div class="panel-header">STRATEGIC RATIONALE</div>', unsafe_allow_html=True)
-            narratives = []
-            for asset in ['EQUITY', 'BONDS', 'GOLD']:
-                if asset in strategic_signals:
-                    sig = strategic_signals[asset]
-                    details = sig['details']
-                    if details:
-                        top_bullish = next((d['Driver'] for d in sorted(details, key=lambda x: x['Contribution'], reverse=True) if d['Signal'] == 'BULLISH'), None)
-                        top_bearish = next((d['Driver'] for d in sorted(details, key=lambda x: x['Contribution']) if d['Signal'] == 'BEARISH'), None)
-                        
-                        nar = f"**{asset}**: **{sig['recommendation']}** ({sig['n_drivers']} drivers)."
-                        if top_bullish: nar += f" {top_bullish} is a major tailwind."
-                        if top_bearish: nar += f" {top_bearish} is a headwind."
-                        narratives.append(nar)
-            
-            if narratives:
-                st.markdown(f"""
-                <div style="background:#111; border:1px solid #2a2a2a; padding:1rem; margin-bottom:2rem; border-radius:2px; font-size:0.85rem; color:#ccc; font-family:'IBM Plex Sans';">
-                    {"<br>".join(narratives)}<br><br>
-                    <span style="color:#888; font-size:0.75rem;">Regime: {status} | Stress Score: {stress_score:.2f}</span>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("Insufficient data for strategic signal generation.")
-
-        col_l, col_r = st.columns([1, 2])
-        
-        with col_l:
-            st.markdown('<div class="panel-header">TARGET ALLOCATION</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_allocation(weights), use_container_width=True, config={'displayModeBar': False})
-            
+            narrative = generate_narrative(expected_returns, driver_attributions, regime_status)
             st.markdown(f"""
-            <table class="data-table">
-                <tr><th>Asset</th><th>Weight</th></tr>
-                <tr><td style="color:#ff6b35">EQUITY</td><td>{weights['EQUITY']:.0%}</td></tr>
-                <tr><td style="color:#4da6ff">BONDS</td><td>{weights['BONDS']:.0%}</td></tr>
-                <tr><td style="color:#ffd700">GOLD</td><td>{weights['GOLD']:.0%}</td></tr>
-            </table>
+            <div style="background:#111; border:1px solid #2a2a2a; padding:1rem; border-radius:2px; font-size:0.85rem; color:#ccc;">
+                {narrative}
+            </div>
             """, unsafe_allow_html=True)
-        
-        with col_r:
-            st.markdown('<div class="panel-header">ASSET PERFORMANCE (10Y)</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_assets(asset_prices.tail(120)), use_container_width=True, config={'displayModeBar': False})
             
-            st.markdown('<div class="panel-header">ERROR CORRECTION TERM</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_ect(ect.tail(240)), use_container_width=True, config={'displayModeBar': False})
-    
     with tab2:
-        st.markdown(f"""
-        <div style="background:#111; border:1px solid #2a2a2a; padding:1rem; margin-bottom:1rem; border-radius:2px;">
-            <span style="font-family:'IBM Plex Mono'; font-size:0.85rem; color:#888;">
-                <span style="color:#ff6b35">STABILITY ANALYSIS:</span> 
-                Features below appeared in ≥{min_persistence:.0%} of {n_windows} expanding windows.
-                These are reliable macro drivers for strategic positioning.
-            </span>
-        </div>
-        """, unsafe_allow_html=True)
-        
+        st.markdown('<div class="panel-header">STABLE MACRO DRIVERS (PERSISTENCE > 60%)</div>', unsafe_allow_html=True)
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
-            st.markdown(f'<div class="panel-header">{asset}</div>', unsafe_allow_html=True)
-            
-            if asset in stability_results:
-                result = stability_results[asset]
-                stable_feats = result.get('stable_features', [])
-                persistence = result.get('persistence', pd.Series())
-                sign_cons = result.get('sign_consistency', pd.Series())
-                mean_coefs = result.get('mean_coefficients', pd.Series())
+            with st.expander(f"Drivers for {asset}", expanded=(asset=='EQUITY')):
+                attr = driver_attributions[asset]
+                selection = st.dataframe(
+                    attr, 
+                    hide_index=True, 
+                    width='stretch',
+                    on_select='rerun',
+                    selection_mode='single-row'
+                )
                 
-                if stable_feats:
-                    rows = []
-                    for feat in stable_feats[:10]:
-                        base_var = feat.split('_')[0]
-                        lag_type = '_'.join(feat.split('_')[1:]) if '_' in feat else 'L1'
-                        
-                        # Get trend
-                        trend_row = trend_analysis[trend_analysis['Variable'] == base_var]
-                        if not trend_row.empty:
-                            secular = trend_row['Secular_Trend'].iloc[0]
-                            slope_5y = trend_row['Slope_5Y'].iloc[0]
-                        else:
-                            secular = 'N/A'
-                            slope_5y = 0
-                        
-                        coef = mean_coefs.get(feat, 0)
-                        pers = persistence.get(feat, 0)
-                        sign_c = sign_cons.get(feat, 0)
-                        
-                        rows.append({
-                            'Feature': feat,
-                            'Description': descriptions.get(base_var, 'N/A'),
-                            'Base Var': base_var,
-                            'Lag': lag_type,
-                            'Coefficient': f"{coef:+.4f}",
-                            'Persistence': f"{pers:.0%}",
-                            'Sign Consist.': f"{sign_c:.0%}",
-                            '5Y Trend': secular,
-                            '5Y Slope': f"{slope_5y:+.2f}"
-                        })
+                selected_rows = selection.get('selection', {}).get('rows', [])
+                if selected_rows:
+                    row_idx = selected_rows[0]
+                    selected_feat = attr.iloc[row_idx]['feature']
                     
-                    df_key = f"df_{asset}"
-                    selection = st.dataframe(
-                        pd.DataFrame(rows), 
-                        hide_index=True, 
-                        use_container_width=True,
-                        on_select='rerun',
-                        selection_mode='single-row',
-                        key=df_key
+                    st.plotly_chart(
+                        plot_driver_vs_asset(macro_features, y_forward, selected_feat, asset, descriptions),
+                        width='stretch'
                     )
-                    
-                    # Handle selection
-                    selected_rows = selection.get('selection', {}).get('rows', [])
-                    if selected_rows:
-                        row_idx = selected_rows[0]
-                        selected_feat = rows[row_idx]['Feature']
-                        
-                        st.plotly_chart(
-                            plot_driver_vs_asset(kernel_features, asset_prices, selected_feat, asset, descriptions),
-                            use_container_width=True, 
-                            config={'displayModeBar': False}
-                        )
-                    
-                    # Boxplot
-                    st.plotly_chart(plot_stability_boxplot(stability_results, asset, descriptions),
-                                   use_container_width=True, config={'displayModeBar': False})
-                else:
-                    # Show what we have anyway
-                    st.warning(f"No stable features found for {asset}. Showing top coefficients instead.")
-                    if 'mean_coefficients' in result:
-                        top_coefs = result['mean_coefficients'].abs().sort_values(ascending=False).head(10)
-                        st.dataframe(pd.DataFrame({
-                            'Feature': top_coefs.index,
-                            'Abs Coefficient': top_coefs.values
-                        }), hide_index=True)
-            
-            st.divider()
-    
-    with tab3:
-        st.markdown('<div class="panel-header">SECULAR TRENDS (5-10 YEAR VIEW)</div>', unsafe_allow_html=True)
-        
-        # Format trend table
-        display_df = trend_analysis[['Variable', 'Secular_Trend', 'Cycle_Position', 
-                                     'Slope_2Y', 'Slope_5Y', 'Slope_10Y', 'Z_Score_5Y', 'Percentile']].copy()
-        display_df['Description'] = display_df['Variable'].map(descriptions)
-        
-        st.dataframe(
-            display_df,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                'Variable': st.column_config.TextColumn('Variable'),
-                'Description': st.column_config.TextColumn('Description'),
-                'Secular_Trend': st.column_config.TextColumn('5Y Trend'),
-                'Cycle_Position': st.column_config.TextColumn('Cycle'),
-                'Slope_2Y': st.column_config.NumberColumn('2Y Slope', format="%.2f"),
-                'Slope_5Y': st.column_config.NumberColumn('5Y Slope', format="%.2f"),
-                'Slope_10Y': st.column_config.NumberColumn('10Y Slope', format="%.2f"),
-                'Z_Score_5Y': st.column_config.NumberColumn('Z-Score', format="%.2f"),
-                'Percentile': st.column_config.NumberColumn('Pctl', format="%.0f%%")
-            }
-        )
-        
-        st.markdown('<div class="panel-header">KEY DRIVERS BY ASSET</div>', unsafe_allow_html=True)
-        
-        for asset in ['EQUITY', 'BONDS', 'GOLD']:
-            if asset in stability_results:
-                stable_feats = stability_results[asset].get('stable_features', [])[:8]
-                base_vars = list(set([f.split('_')[0] for f in stable_feats]))
                 
-                if base_vars:
-                    st.markdown(f"**{asset}** key drivers:")
-                    st.plotly_chart(plot_trend_bars(trend_analysis, base_vars, descriptions),
-                                   use_container_width=True, config={'displayModeBar': False})
-    
+                # Stability Boxplot
+                st.plotly_chart(plot_stability_boxplot(stability_results_map, asset, descriptions), width='stretch')
+
+    with tab3:
+        st.markdown('<div class="panel-header">HISTORICAL BACKTEST (IN-SAMPLE PREDICTION)</div>', unsafe_allow_html=True)
+        asset_to_plot = st.selectbox("Select Asset", ['EQUITY', 'BONDS', 'GOLD'])
+        
+        # Compute historical predictions
+        hac = model_stats[asset_to_plot]
+        stable_feats = stability_results_map[asset_to_plot]['stable_features']
+        X_asset = X[stable_feats]
+        
+        # Pred = Intercept + X * Beta
+        intercept = hac['coefficients']['const']
+        beta = hac['coefficients'].drop('const')
+        hist_pred = intercept + X_asset.dot(beta)
+        
+        # Simplified CI for history
+        se = hac['std_errors'].mean()
+        t_crit = t.ppf((1 + confidence_level) / 2, df=100)
+        hist_lower = hist_pred - t_crit * se
+        hist_upper = hist_pred + t_crit * se
+        
+        st.plotly_chart(plot_backtest(y[asset_to_plot], hist_pred, hist_lower, hist_upper), width='stretch')
+        
+        # Stats
+        r2 = hac['r_squared']
+        corr = y[asset_to_plot].corr(hist_pred)
+        st.markdown(f"**R-Squared:** {r2:.2f} | **Correlation:** {corr:.2f}")
+
     with tab4:
-        col1, col2 = st.columns(2)
+        st.markdown('<div class="panel-header">DIAGNOSTICS & PARAMETERS</div>', unsafe_allow_html=True)
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.markdown("**Regime Indicators**")
+            st.dataframe(pd.DataFrame([{'Indicator': k, 'Value': v} for k,v in stress_indicators.items()]), hide_index=True)
+        with col_d2:
+            st.markdown("**Model Details**")
+            for asset in ['EQUITY', 'BONDS', 'GOLD']:
+                st.text(f"{asset} Model: {len(stability_results_map[asset]['stable_features'])} drivers selected.")
         
-        with col1:
-            st.markdown('<div class="panel-header">COINTEGRATION</div>', unsafe_allow_html=True)
-            if 'eigenvalues' in coint_results:
-                coint_df = pd.DataFrame({
-                    'r': range(len(coint_results['eigenvalues'])),
-                    'Eigenvalue': coint_results['eigenvalues'],
-                    'Trace': coint_results['trace_stats'],
-                    'Crit 5%': coint_results['critical_values']
-                })
-                st.dataframe(coint_df.head(5), hide_index=True)
-        
-        with col2:
-            st.markdown('<div class="panel-header">STRESS INDICATORS</div>', unsafe_allow_html=True)
-            stress_df = pd.DataFrame([
-                {'Indicator': k.title(), 'Z-Score': v, 'Status': 'OK' if abs(v) < 1.5 else 'ELEVATED'}
-                for k, v in stress_indicators.items()
-            ])
-            st.dataframe(stress_df, hide_index=True)
-        
-        st.markdown('<div class="panel-header">PARAMETERS</div>', unsafe_allow_html=True)
-        st.markdown(f"""
-        | Parameter | Value | Notes |
-        |-----------|-------|-------|
-        | L1 Ratio | {l1_ratio} | {'Ridge-biased' if l1_ratio < 0.4 else 'Balanced' if l1_ratio < 0.7 else 'Lasso-biased'} |
-        | Alpha | {alpha} | {'Very light' if alpha < 0.001 else 'Light' if alpha < 0.005 else 'Moderate'} |
-        | Windows | {n_windows} | Expanding windows |
-        | Min Persistence | {min_persistence:.0%} | Feature selection threshold |
-        | Data Range | {macro_data.index[0].strftime('%Y-%m')} to {macro_data.index[-1].strftime('%Y-%m')} | {len(macro_data)} months |
-        """)
-    
-    # Footer
-    st.markdown("""
-    <div style="margin-top:2rem; padding-top:1rem; border-top:1px solid #2a2a2a; text-align:center;">
-        <span style="font-family:'IBM Plex Mono'; font-size:0.65rem; color:#555;">
-            VECM V2 · STABILITY-ENHANCED · 5-10Y HORIZON
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
+        if st.button("Export Results Summary"):
+            summary_df = pd.DataFrame(summary_data)
+            st.download_button("Download CSV", summary_df.to_csv(index=False), "expected_returns.csv", "text/csv")
 
 
 if __name__ == "__main__":
