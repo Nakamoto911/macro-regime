@@ -207,7 +207,7 @@ st.markdown("""
 # DATA PIPELINE
 # ============================================================================
 
-def compute_forward_returns(prices: pd.DataFrame, horizon_months: int = 60) -> pd.DataFrame:
+def compute_forward_returns(prices: pd.DataFrame, horizon_months: int = 12) -> pd.DataFrame:
     """
     Compute annualized forward returns for each asset.
     """
@@ -409,100 +409,113 @@ def estimate_with_hac(y: pd.Series, X: pd.DataFrame, lag: int = 59) -> dict:
 
 
 def select_features_elastic_net(y: pd.Series, X: pd.DataFrame, 
+                                 n_iterations: int = 50,
+                                 sample_fraction: float = 0.7,
+                                 threshold: float = 0.7,
                                  l1_ratio: float = 0.5) -> tuple:
     """
-    Use cross-validated Elastic Net to select non-zero features.
+    Implement Stability Selection via bootstrapping.
     """
+    from sklearn.linear_model import ElasticNet
+    
     # Standardize
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
     
-    # Elastic Net with CV
-    # Using TimeSeriesSplit for CV as per spec suggestion
-    tscv = TimeSeriesSplit(n_splits=5)
-    model = ElasticNetCV(
-        l1_ratio=l1_ratio,
-        cv=tscv,
-        max_iter=10000
-    )
-    model.fit(X_scaled, y)
+    n_features = X.shape[1]
+    selection_counts = pd.Series(0, index=X.columns)
     
-    # Return features with non-zero coefficients
-    selected = X.columns[model.coef_ != 0].tolist()
-    return selected, model.coef_, model.alpha_
+    # 1. Bootstrapping Loop
+    for _ in range(n_iterations):
+        # Subsample indices
+        sample_size = int(len(y) * sample_fraction)
+        indices = np.random.choice(len(y), size=sample_size, replace=False)
+        
+        y_sample = y.iloc[indices]
+        X_sample = X_scaled.iloc[indices]
+        
+        # Fit a simple ElasticNet (faster than CV for each bootstrap)
+        # We use a small alpha for selection
+        model = ElasticNet(alpha=0.01, l1_ratio=l1_ratio, max_iter=5000)
+        model.fit(X_sample, y_sample)
+        
+        # Record non-zero coefficients
+        selection_counts[model.coef_ != 0] += 1
+        
+    # 2. Calculate Probabilities
+    selection_probs = selection_counts / n_iterations
+    
+    # 3. Apply Threshold
+    selected = selection_probs[selection_probs > threshold].index.tolist()
+    
+    # 4. Fallback Logic: ensure at least one feature
+    if not selected and not selection_probs.empty:
+        selected = [selection_probs.idxmax()]
+    
+    return selected, selection_probs
 
 
 def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame, 
                               min_train_months: int = 120, 
-                              horizon_months: int = 60,
-                              rebalance_freq: int = 12) -> pd.DataFrame:
+                              horizon_months: int = 12,
+                              rebalance_freq: int = 12) -> tuple:
     """
     Recursive walk-forward (expanding window) backtest.
-    Ensures no look-ahead bias by only training on fully realized returns.
+    Returns: (oos_results_df, selection_history_df)
     """
     import statsmodels.api as sm
     from scipy.stats import t
     
     results = []
+    selection_history = []
     dates = X.index
     
-    # Starting point: we need enough data for the first training set
-    # and the target needs to be realized by the time we make the prediction.
-    # Prediction date starts after min_train_months + horizon_months.
     start_idx = min_train_months + horizon_months
     
     if start_idx >= len(dates):
-        return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci'])
+        return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci']), pd.DataFrame()
 
-    # Loop through rebalance dates
     for i in range(start_idx, len(dates), rebalance_freq):
         current_date = dates[i]
         
-        # 1. Define Training Set (Strictly No Peeking)
-        # We can only train on data where the return is already KNOWN.
-        # Known date limit = current_date - horizon_months
         train_limit = current_date - pd.DateOffset(months=horizon_months)
         train_mask = X.index <= train_limit
         
         X_train_all = X[train_mask]
-        y_train_all = y[train_mask].dropna() # Align indices
+        y_train_all = y[train_mask].dropna()
         X_train = X_train_all.loc[y_train_all.index]
         
-        # Data Sufficiency check
         if len(y_train_all) < 60:
             continue
             
-        # 2. Select Features (Dynamically!)
-        selected_feats, _, _ = select_features_elastic_net(y_train_all, X_train)
+        # 2. Stability Selection
+        selected_feats, selection_probs = select_features_elastic_net(y_train_all, X_train)
+        
+        # Store selection history
+        selection_probs_dict = selection_probs.to_dict()
+        selection_probs_dict['date'] = current_date
+        selection_history.append(selection_probs_dict)
         
         # Determine prediction window
         end_window = min(i + rebalance_freq, len(dates))
         predict_idx = dates[i : end_window]
         X_live_full = X.loc[predict_idx]
         
+        # 3. Estimate Final Model (OLS on selected features)
         if not selected_feats:
-            # Fallback: Historical Mean
             pred_vals = pd.Series(y_train_all.mean(), index=predict_idx)
             se = y_train_all.std()
         else:
-            # 3. Estimate Model
             hac_res = estimate_with_hac(y_train_all, X_train[selected_feats], lag=horizon_months)
             model = hac_res['model']
             
-            # 4. Predict
             X_live = X_live_full[selected_feats]
             X_live_const = sm.add_constant(X_live, has_constant='add')
-            
-            # Ensure all columns from training are present in prediction
             pred_vals = model.predict(X_live_const)
-            
-            # Prediction SE (simplified as per instruction)
             se = hac_res['std_errors'].mean()
         
-        # t-critical for 90% CI (consistent with app)
         t_crit = t.ppf(0.95, df=len(y_train_all)-len(selected_feats)-1) if selected_feats else 1.66
         
-        # Store results
         for date in predict_idx:
             val = pred_vals.loc[date]
             results.append({
@@ -513,13 +526,16 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
             })
             
     if not results:
-        return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci'])
+        return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci']), pd.DataFrame()
         
-    return pd.DataFrame(results).set_index('date')
+    oos_df = pd.DataFrame(results).set_index('date')
+    selection_df = pd.DataFrame(selection_history).set_index('date')
+    
+    return oos_df, selection_df
 
 
 @st.cache_data(show_spinner=False)
-def cached_walk_forward(y, X, min_train_months=120, horizon_months=60, rebalance_freq=12):
+def cached_walk_forward(y, X, min_train_months=120, horizon_months=12, rebalance_freq=12):
     return run_walk_forward_backtest(y, X, min_train_months, horizon_months, rebalance_freq)
 
 
@@ -553,6 +569,7 @@ def time_series_cv(y: pd.Series, X: pd.DataFrame, n_splits: int = 5):
 
 
 def stability_analysis(y: pd.Series, X: pd.DataFrame, 
+                       horizon_months: int = 60,
                        window_years: int = 25,
                        step_years: int = 5) -> list:
     """
@@ -577,14 +594,21 @@ def stability_analysis(y: pd.Series, X: pd.DataFrame,
         if len(y_valid) < 120:  # Minimum 10 years of valid data
             continue
         
-        # Estimate
-        selected_features, coefs, alpha = select_features_elastic_net(y_valid, X_valid)
+        # Estimate using Stability Selection
+        selected_features, selection_probs = select_features_elastic_net(y_valid, X_valid)
+        
+        # Fit OLS on selected features to get coefficients for stability analysis
+        if selected_features:
+            hac_res = estimate_with_hac(y_valid, X_valid[selected_features], lag=horizon_months//2)
+            coef_dict = hac_res['coefficients'].to_dict()
+        else:
+            coef_dict = {col: 0.0 for col in X.columns}
         
         results.append({
             'start_date': y.index[start],
             'end_date': y.index[end - 1],
             'selected_features': selected_features,
-            'coefficients': dict(zip(X.columns, coefs)),
+            'coefficients': coef_dict,
             'n_selected': len(selected_features)
         })
     
@@ -871,10 +895,51 @@ def plot_ect(ect: pd.Series) -> go.Figure:
         paper_bgcolor=theme['paper_bgcolor'],
         plot_bgcolor=theme['plot_bgcolor'],
         margin=dict(l=50, r=20, t=10, b=40),
-        height=200,
+        height=150,
         xaxis=dict(gridcolor='#1a1a1a'),
         yaxis=dict(gridcolor='#1a1a1a', title='ECT')
     )
+    return fig
+
+
+def plot_feature_heatmap(selection_history: pd.DataFrame, descriptions: dict) -> go.Figure:
+    """
+    Visualize stability selection probabilities over time.
+    """
+    if selection_history.empty:
+        return go.Figure()
+        
+    theme = create_theme()
+    
+    # Transpose so variables are on Y-axis and time on X-axis
+    df_plot = selection_history.T
+    
+    # Sort Y-axis by average probability to put most stable on top
+    avg_probs = df_plot.mean(axis=1).sort_values(ascending=True)
+    df_plot = df_plot.loc[avg_probs.index]
+    
+    # Create labels with descriptions
+    y_labels = [f"{col} ({descriptions.get(col.split('_')[0], 'Macro Variable')})" for col in df_plot.index]
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=df_plot.values,
+        x=df_plot.columns,
+        y=y_labels,
+        colorscale=[[0, '#0a0a0a'], [0.5, 'rgba(77, 166, 255, 0.2)'], [1, '#4da6ff']],
+        showscale=True,
+        colorbar=dict(title=dict(text='Selection Prob', side='right'), thickness=15, len=0.7)
+    ))
+    
+    fig.update_layout(
+        title=dict(text='STABILITY SELECTION: FEATURE PERSISTENCE OVER TIME', font=dict(size=12, color='#888')),
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        xaxis=dict(title='Estimation Date', gridcolor='#1a1a1a'),
+        yaxis=dict(gridcolor='#1a1a1a', tickfont=dict(size=9)),
+        margin=dict(l=10, r=10, t=40, b=40),
+        height=500
+    )
+    
     return fig
 
 
@@ -1320,7 +1385,7 @@ def main():
     st.markdown("""
     <div class="header-container">
         <p class="header-title">◈ VECM STRATEGIC ALLOCATION</p>
-        <p class="header-subtitle">FORWARD RETURN PREDICTION · 5-10 YEAR HORIZON</p>
+        <p class=\"header-subtitle\">FORWARD RETURN PREDICTION · 12-MONTH HORIZON</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1332,7 +1397,7 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        horizon_months = st.slider("Horizon (Months)", 36, 120, 60, help="Forward return horizon")
+        horizon_months = st.slider("Horizon (Months)", 3, 36, 12, help="Forward return horizon")
         l1_ratio = st.slider("L1 Ratio", 0.1, 0.9, 0.5, 0.1, help="Elastic Net mixing parameter")
         min_persistence = st.slider("Min Persistence", 0.3, 0.9, 0.6, 0.1, help="Feature selection threshold")
         confidence_level = st.slider("Confidence Level", 0.80, 0.95, 0.90, 0.05)
@@ -1375,19 +1440,17 @@ def main():
         with st.status(f"Analyzing {asset}...", expanded=False):
             y_asset = y[asset]
             
-            # Feature Selection (Full Sample)
-            selected_features, coef_full, alpha = select_features_elastic_net(y_asset.dropna(), X.loc[y_asset.dropna().index], l1_ratio=l1_ratio)
-            
-            # Stability Analysis
-            stab_results = stability_analysis(y_asset, X, window_years=estimation_window_years)
+            # Stability Analysis (Rolling Windows)
+            stab_results = stability_analysis(y_asset, X, horizon_months=horizon_months, window_years=estimation_window_years)
             metrics = compute_stability_metrics(stab_results, X.columns)
             
-            # Filter for STABLE features
-            stable_features = metrics[metrics['persistence'] >= min_persistence]['feature'].tolist()
-            if not stable_features:
-                stable_features = metrics.sort_values('persistence', ascending=False).head(5)['feature'].tolist()
+            # Stability Selection (Full Sample Bootstrapping)
+            stable_features, selection_probs = select_features_elastic_net(
+                y_asset.dropna(), 
+                X.loc[y_asset.dropna().index]
+            )
             
-            # Final OLS Estimation with HAC
+            # Final OLS Estimation with HAC on selected features
             y_valid = y_asset.dropna()
             X_stable = X.loc[y_valid.index][stable_features]
             
@@ -1443,7 +1506,7 @@ def main():
     tab1, tab2, tab3, tab4 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "BACKTEST", "DIAGNOSTICS"])
     
     with tab1:
-        st.markdown('<div class="panel-header">EXPECTED 5Y RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
+        st.markdown('<div class="panel-header">EXPECTED 12M RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
         
         # summary_panel
         summary_data = []
@@ -1517,7 +1580,7 @@ def main():
         
         # Run Walk-Forward Backtest (Cached)
         with st.spinner(f"Running Walk-Forward Backtest for {asset_to_plot}..."):
-            oos_results = cached_walk_forward(
+            oos_results, selection_history = cached_walk_forward(
                 y[asset_to_plot], 
                 X, 
                 min_train_months=120, 
@@ -1563,6 +1626,24 @@ def main():
             st.markdown("**Model Details**")
             for asset in ['EQUITY', 'BONDS', 'GOLD']:
                 st.text(f"{asset} Model: {len(stability_results_map[asset]['stable_features'])} drivers selected.")
+        
+        st.divider()
+        st.markdown("**Feature Selection Persistence**")
+        asset_heatmap = st.selectbox("Select Asset for Heatmap", ['EQUITY', 'BONDS', 'GOLD'], key='heatmap_asset')
+        
+        with st.spinner(f"Loading selection history for {asset_heatmap}..."):
+            _, selection_df = cached_walk_forward(
+                y[asset_heatmap], 
+                X, 
+                min_train_months=120, 
+                horizon_months=horizon_months, 
+                rebalance_freq=12
+            )
+            
+        if not selection_df.empty:
+            st.plotly_chart(plot_feature_heatmap(selection_df, descriptions), width='stretch')
+        else:
+            st.info("No selection history available for this asset.")
         
         if st.button("Export Results Summary"):
             summary_df = pd.DataFrame(summary_data)
