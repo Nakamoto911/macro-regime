@@ -211,6 +211,35 @@ def load_asset_data(start_date: str = '1960-01-01') -> pd.DataFrame:
 # MODEL COMPONENTS
 # ============================================================================
 
+class Winsorizer:
+    """
+    Caps features at a specific Z-score threshold.
+    Aligned with benchmarking_engine.py
+    """
+    def __init__(self, threshold=3.0):
+        self.threshold = threshold
+        self.means_ = None
+        self.stds_ = None
+
+    def fit(self, X, y=None):
+        X_df = pd.DataFrame(X)
+        self.means_ = X_df.mean()
+        self.stds_ = X_df.std()
+        return self
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
+
+    def transform(self, X):
+        X_df = pd.DataFrame(X).copy()
+        for col in X_df.columns:
+            # Handle possible division by zero or NaN std
+            std = self.stds_[col] if self.stds_[col] > 1e-9 else 1e-9
+            z_score = (X_df[col] - self.means_[col]) / std
+            X_df[col] = X_df[col].mask(z_score > self.threshold, self.means_[col] + self.threshold * std)
+            X_df[col] = X_df[col].mask(z_score < -self.threshold, self.means_[col] - self.threshold * std)
+        return X_df
+
 # ============================================================================
 # ESTIMATION LOGIC
 # ============================================================================
@@ -306,7 +335,7 @@ def select_features_elastic_net(y: pd.Series, X: pd.DataFrame,
 
 
 def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame, 
-                              min_train_months: int = 120, 
+                              min_train_months: int = 240, 
                               horizon_months: int = 12,
                               rebalance_freq: int = 12,
                               asset_class: str = 'EQUITY') -> tuple:
@@ -344,66 +373,61 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
         predict_idx = dates[i : end_window]
             
         if asset_class == 'EQUITY':
-            # 1a. EQUITY: Hardcoded Top 10 Features from Benchmark
-            selected_feats = [
-                'HOUST_MA60', 'UNRATE_MA12', 'M2_slope12', 'BAA_AAA_MA60', 
-                'PPI_zscore', 'BAA_AAA_slope12', 'INDPRO_MA12', 
-                'UNRATE_slope60', 'INDPRO_slope60', 'M2_zscore'
-            ]
-            # Ensure features exist
-            selected_feats = [f for f in selected_feats if f in X_train.columns]
+            # EQUITY: Random Forest on ALL features (mirrors benchmark)
+            # Benchmark start_idx=240, step=12, horizon=12
+            win = Winsorizer(threshold=3.0)
+            X_train_clean = win.fit_transform(X_train)
+            X_live_clean = win.transform(X.loc[predict_idx])
             
-            # 2a. EQUITY: Random Forest Model
             model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42)
-            model.fit(X_train[selected_feats], y_train_all)
+            model.fit(X_train_clean, y_train_all)
             
-            # Store mock selection probs
-            selection_probs_dict = {f: 1.0 for f in selected_feats}
-            selection_probs_dict['date'] = current_date
-            selection_history.append(selection_probs_dict)
+            # Record selection (in RF, we can use importance as proxy)
+            importance = pd.Series(model.feature_importances_, index=X.columns)
+            selection_history.append({**importance.to_dict(), 'date': current_date})
             
-            # Predict
-            X_live = X.loc[predict_idx][selected_feats]
-            raw_preds = model.predict(X_live)
+            raw_preds = model.predict(X_live_clean)
             pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
-            se = np.std(y_train_all - model.predict(X_train[selected_feats]))
+            se = np.std(y_train_all - model.predict(X_train_clean))
+            n_features = X_train_clean.shape[1]
 
         elif asset_class == 'BONDS':
-            # 1b. BONDS: ElasticNet (Automatic select)
-            selected_feats, selection_probs = select_features_elastic_net(y_train_all, X_train)
-            selection_probs_dict = selection_probs.to_dict()
-            selection_probs_dict['date'] = current_date
-            selection_history.append(selection_probs_dict)
+            # BONDS: ElasticNetCV on ALL features (mirrors benchmark)
+            win = Winsorizer(threshold=3.0)
+            X_train_clean = win.fit_transform(X_train)
+            X_live_clean = win.transform(X.loc[predict_idx])
             
-            # 2b. BONDS: ElasticNetCV
-            from sklearn.linear_model import ElasticNetCV
-            model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5)
-            model.fit(X_train[selected_feats], y_train_all)
+            model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=5000)
+            model.fit(X_train_clean, y_train_all)
             
-            # Predict
-            X_live = X.loc[predict_idx][selected_feats]
-            raw_preds = model.predict(X_live)
+            # Record selection
+            coefs = pd.Series(model.coef_, index=X.columns)
+            selection_history.append({**coefs.to_dict(), 'date': current_date})
+            
+            raw_preds = model.predict(X_live_clean)
             pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
-            se = np.std(y_train_all - model.predict(X_train[selected_feats]))
+            se = np.std(y_train_all - model.predict(X_train_clean))
+            n_features = X_train_clean.shape[1]
 
         else: # GOLD
-            # 1c. GOLD: Simple OLS (Automatic select or hardcoded)
-            selected_feats, selection_probs = select_features_elastic_net(y_train_all, X_train)
-            selection_probs_dict = selection_probs.to_dict()
-            selection_probs_dict['date'] = current_date
-            selection_history.append(selection_probs_dict)
+            # GOLD: Simple OLS on ALL features (mirrors benchmark)
+            win = Winsorizer(threshold=3.0)
+            X_train_clean = win.fit_transform(X_train)
+            X_live_clean = win.transform(X.loc[predict_idx])
             
-            # 2c. GOLD: LinearRegression
             model = LinearRegression()
-            model.fit(X_train[selected_feats], y_train_all)
+            model.fit(X_train_clean, y_train_all)
             
-            # Predict
-            X_live = X.loc[predict_idx][selected_feats]
-            raw_preds = model.predict(X_live)
+            # Record selection
+            coefs = pd.Series(model.coef_, index=X.columns)
+            selection_history.append({**coefs.to_dict(), 'date': current_date})
+            
+            raw_preds = model.predict(X_live_clean)
             pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
-            se = np.std(y_train_all - model.predict(X_train[selected_feats]))
+            se = np.std(y_train_all - model.predict(X_train_clean))
+            n_features = X_train_clean.shape[1]
         
-        t_crit = t.ppf(0.95, df=len(y_train_all)-len(selected_feats)-1) if selected_feats else 1.66
+        t_crit = t.ppf(0.95, df=len(y_train_all)-n_features-1) if n_features > 0 else 1.66
         
         for date in predict_idx:
             val = pred_vals.loc[date]
@@ -424,7 +448,7 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
 
 
 @st.cache_data(show_spinner=False)
-def cached_walk_forward(y, X, min_train_months=120, horizon_months=12, rebalance_freq=12, asset_class='EQUITY'):
+def cached_walk_forward(y, X, min_train_months=240, horizon_months=12, rebalance_freq=12, asset_class='EQUITY'):
     return run_walk_forward_backtest(y, X, min_train_months, horizon_months, rebalance_freq, asset_class)
 
 
@@ -1586,88 +1610,72 @@ def main():
                 X.loc[y_asset.dropna().index]
             )
             
-            # Final Asset-Specific Estimation
+            # Final Asset-Specific Estimation (Full Sample) - Use same min_train logic
+            # To match the backtest's latest stability, we use the last 240+12 months or full history
             y_valid = y_asset.dropna()
+            X_valid = X.loc[y_valid.index]
+            
+            # For the final "Live" model, we use the full history if it's long enough, 
+            # but ensure we align with the winsorization used in the backtest.
+            win = Winsorizer(threshold=3.0)
+            X_valid_clean = win.fit_transform(X_valid)
+            X_current_clean = win.transform(X.tail(1))
             
             if asset == 'EQUITY':
-                selected_features = [
-                    'HOUST_MA60', 'UNRATE_MA12', 'M2_slope12', 'BAA_AAA_MA60', 
-                    'PPI_zscore', 'BAA_AAA_slope12', 'INDPRO_MA12', 
-                    'UNRATE_slope60', 'INDPRO_slope60', 'M2_zscore'
-                ]
-                selected_features = [f for f in selected_features if f in X.columns]
-                X_final = X.loc[y_valid.index][selected_features]
-                
                 model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42)
-                model.fit(X_final, y_valid)
+                model.fit(X_valid_clean, y_valid)
                 
-                # Mock HAC results for RF to keep main loop working
+                exp_ret = model.predict(X_current_clean)[0]
+                prediction_se = np.std(y_valid - model.predict(X_valid_clean))
+                
+                # Mock results for UI display
                 hac_results = {
                     'model': model,
-                    'coefficients': pd.Series(0, index=selected_features + ['const']),
-                    'std_errors': pd.Series(y_valid.std(), index=selected_features + ['const']),
-                    'intercept': 0 # Not directly used for RF prediction here but for compat
+                    'coefficients': pd.Series(0, index=X.columns.tolist() + ['const']),
+                    'intercept': 0,
+                    'importance': pd.Series(model.feature_importances_, index=X.columns)
                 }
-                # Special handling for RF "coefficients" (feature importance)
-                importance = pd.Series(model.feature_importances_, index=selected_features)
-                hac_results['importance'] = importance
-                
-                exp_ret = model.predict(X.iloc[-1][selected_features].values.reshape(1, -1))[0]
-                prediction_se = np.std(y_valid - model.predict(X_final))
-                beta = importance # Use importance as "proxy" for beta in attribution/display if needed
-                intercept = 0
+                beta = hac_results['importance']
+                selected_features = X.columns.tolist()
 
             elif asset == 'BONDS':
-                selected_features, selection_probs = select_features_elastic_net(y_valid, X.loc[y_valid.index])
-                X_final = X.loc[y_valid.index][selected_features]
+                model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=5000)
+                model.fit(X_valid_clean, y_valid)
                 
-                model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5)
-                model.fit(X_final, y_valid)
+                exp_ret = model.predict(X_current_clean)[0]
+                prediction_se = np.std(y_valid - model.predict(X_valid_clean))
                 
                 hac_results = {
                     'model': model,
-                    'coefficients': pd.Series(model.coef_, index=selected_features),
-                    'std_errors': pd.Series(0.01, index=selected_features), # Proxy
+                    'coefficients': pd.Series(model.coef_, index=X.columns),
                     'intercept': model.intercept_
                 }
-                hac_results['coefficients']['const'] = model.intercept_
-                
-                exp_ret = model.predict(X.iloc[-1][selected_features].values.reshape(1, -1))[0]
-                prediction_se = np.std(y_valid - model.predict(X_final))
-                beta = pd.Series(model.coef_, index=selected_features)
-                intercept = model.intercept_
+                beta = pd.Series(model.coef_, index=X.columns)
+                selected_features = beta[beta != 0].index.tolist()
 
             else: # GOLD
-                selected_features, selection_probs = select_features_elastic_net(y_valid, X.loc[y_valid.index])
-                X_final = X.loc[y_valid.index][selected_features]
-                
                 model = LinearRegression()
-                model.fit(X_final, y_valid)
+                model.fit(X_valid_clean, y_valid)
+                
+                exp_ret = model.predict(X_current_clean)[0]
+                prediction_se = np.std(y_valid - model.predict(X_valid_clean))
                 
                 hac_results = {
                     'model': model,
-                    'coefficients': pd.Series(model.coef_, index=selected_features),
-                    'std_errors': pd.Series(0.01, index=selected_features), # Proxy
+                    'coefficients': pd.Series(model.coef_, index=X.columns),
                     'intercept': model.intercept_
                 }
-                hac_results['coefficients']['const'] = model.intercept_
-                
-                exp_ret = model.predict(X.iloc[-1][selected_features].values.reshape(1, -1))[0]
-                prediction_se = np.std(y_valid - model.predict(X_final))
-                beta = pd.Series(model.coef_, index=selected_features)
-                intercept = model.intercept_
+                beta = pd.Series(model.coef_, index=X.columns)
+                selected_features = X.columns.tolist()
             
             ci = compute_confidence_interval(exp_ret, prediction_se, confidence=confidence_level)
             
             # Attribution
-            feature_means = X[selected_features].mean()
+            feature_means = X_valid_clean.mean()
             if asset == 'EQUITY':
-                # For RF, attribution is harder, use simplified version
-                attribution = pd.DataFrame([{
-                    'feature': f, 'contribution': 0, 'direction': 'NEUTRAL'
-                } for f in selected_features])
+                attribution = pd.DataFrame([{'feature': f, 'contribution': 0, 'direction': 'NEUTRAL'} for f in X.columns])
             else:
-                attribution = compute_driver_attribution(X.iloc[-1][selected_features], beta, feature_means)
+                attribution = compute_driver_attribution(X_current_clean.iloc[0], beta, feature_means)
             
             # Storage
             expected_returns[asset] = exp_ret
@@ -1781,7 +1789,7 @@ def main():
             oos_results, selection_history = cached_walk_forward(
                 y[asset_to_plot], 
                 X, 
-                min_train_months=120, 
+                min_train_months=240, 
                 horizon_months=horizon_months, 
                 rebalance_freq=12,
                 asset_class=asset_to_plot
@@ -1833,7 +1841,7 @@ def main():
             _, selection_df = cached_walk_forward(
                 y[asset_heatmap], 
                 X, 
-                min_train_months=120, 
+                min_train_months=240, 
                 horizon_months=horizon_months, 
                 rebalance_freq=12,
                 asset_class=asset_heatmap
