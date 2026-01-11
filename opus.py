@@ -2266,7 +2266,7 @@ def main():
                 spikedistance=-1
             )
             
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, width='stretch', config={'displayModeBar': False})
             
             if len(active_series) > 15:
                 st.warning(f"Displaying {len(active_series)} series. Use asset filters to focus on key drivers.")
