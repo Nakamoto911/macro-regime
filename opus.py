@@ -1152,7 +1152,7 @@ def plot_combined_driver_analysis(feat_data: pd.DataFrame, asset_returns: pd.Dat
     fig.add_trace(go.Scatter(
         x=combined.index, y=asset_vals, name=asset,
         mode='lines', line=dict(color='#4da6ff', width=1.5),
-        hovertemplate="<b>" + asset + f" {horizon_months}M Return</b>: %{y:.2%}<extra></extra>"
+        hovertemplate="<b>" + asset + f" {horizon_months}M Return</b>: %{{y:.2%}}<extra></extra>"
     ), row=1, col=1, secondary_y=True)
     
     # 2. Bottom Panel: Rolling Correlation
@@ -1384,8 +1384,8 @@ def generate_narrative(expected_returns: dict,
         exp_ret = expected_returns[asset]
         attr = driver_attributions[asset]
         
-        tailwinds = attr[attr['direction'] == 'TAILWIND'].head(2)
-        headwinds = attr[attr['direction'] == 'HEADWIND'].head(2)
+        tailwinds = attr[attr['Impact'] > 0.005].sort_values('Impact', ascending=False).head(2)
+        headwinds = attr[attr['Impact'] < -0.005].sort_values('Impact', ascending=True).head(2)
         
         # Extract feature names (remove transformation suffixes for display)
         tailwind_list = [f.split('_')[0] for f in tailwinds['feature'].tolist()]
@@ -1721,12 +1721,39 @@ def main():
             
             ci = compute_confidence_interval(exp_ret, prediction_se, confidence=confidence_level)
             
-            # Attribution
+            # Detailed Attribution & Impact Analysis
             feature_means = X_valid_clean.mean()
+            corrs = X_valid_clean.corrwith(y_valid)
+            current_states = X_current_clean.iloc[0]
+            
             if asset == 'EQUITY':
-                attribution = pd.DataFrame([{'feature': f, 'contribution': 0, 'direction': 'NEUTRAL'} for f in X.columns])
+                # For non-linear, we use Importance * Sign(Corr) * State as a directional proxy
+                attribution = pd.DataFrame({
+                    'feature': X.columns,
+                    'Weight': model.feature_importances_,
+                    'Link': corrs.values,
+                    'State': current_states.values
+                })
+                attribution['Impact'] = attribution['Weight'] * np.sign(attribution['Link']) * attribution['State']
+                attribution = attribution.sort_values('Weight', ascending=False)
             else:
-                attribution = compute_driver_attribution(X_current_clean.iloc[0], beta, feature_means)
+                # For linear, impact is simply Beta * State
+                attribution = pd.DataFrame({
+                    'feature': X.columns,
+                    'Weight': beta.values,
+                    'Link': corrs.values,
+                    'State': current_states.values,
+                })
+                attribution['Impact'] = attribution['Weight'] * attribution['State']
+                attribution = attribution.sort_values(attribution['Weight'].abs().name or 'Weight', ascending=False, key=lambda x: x.abs())
+
+            # Map impact to visual signals
+            def get_signal(val):
+                if val > 0.005: return "🟢 Bullish"
+                if val < -0.005: return "🔴 Bearish"
+                return "⚪ Neutral"
+            
+            attribution['Signal'] = attribution['Impact'].apply(get_signal)
             
             # Storage
             expected_returns[asset] = exp_ret
@@ -1805,11 +1832,18 @@ def main():
                 
                 attr = driver_attributions[asset]
                 selection = st.dataframe(
-                    attr, 
+                    attr[['feature', 'Signal', 'Weight', 'State', 'Link']], 
                     hide_index=True, 
                     width='stretch',
                     on_select='rerun',
-                    selection_mode='single-row'
+                    selection_mode='single-row',
+                    column_config={
+                        'feature': st.column_config.TextColumn("Driver", width="medium"),
+                        'Signal': st.column_config.TextColumn("Current Signal", width="small"),
+                        'Weight': st.column_config.NumberColumn("Weight", format="%.3f", help="Predictive impact of the driver"),
+                        'State': st.column_config.NumberColumn("State (Z)", format="%.2f", help="Current Z-score of the macro driver"),
+                        'Link': st.column_config.NumberColumn("Link (Corr)", format="%.2f", help="Historical correlation with asset returns")
+                    }
                 )
                 
                 selected_rows = selection.get('selection', {}).get('rows', [])
