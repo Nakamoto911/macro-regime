@@ -37,6 +37,16 @@ NBER_RECESSIONS = [
     ('2020-02-01', '2020-04-01')
 ]
 
+TRANSFORMATION_LABELS = {
+    1: "Level",
+    2: "Δ",
+    3: "Δ²",
+    4: "log",
+    5: "Δlog",
+    6: "Δ²log",
+    7: "Δpct"
+}
+
 # Streamlit Setup moved to main()
 
 # CSS moved to main()
@@ -2050,125 +2060,166 @@ def main():
                 st.plotly_chart(plot_variable_survival(stability_results_map, asset, descriptions), width='stretch')
 
     with tab3:
-        # Checkbox filters for impactful series
-        st.markdown("**Display series with high impact on:**")
-        cols = st.columns(4)
-        with cols[0]:
-            f_equity = st.checkbox("Equity", value=False, key="check_equity")
-        with cols[1]:
+        # Asset and Display Mode Selection on a single row
+        sel_col1, sel_col2, sel_col3, sel_col4, sel_col5, sel_col6 = st.columns([1.5, 1, 1, 1, 2, 3])
+        with sel_col1:
+            st.markdown("**Impact on:**")
+        with sel_col2:
+            f_equity = st.checkbox("Equity", value=True, key="check_equity")
+        with sel_col3:
             f_bonds = st.checkbox("Bonds", value=False, key="check_bonds")
-        with cols[2]:
+        with sel_col4:
             f_gold = st.checkbox("Gold", value=False, key="check_gold")
-        with cols[3]:
-            f_all = st.checkbox("Show All", value=not (f_equity or f_bonds or f_gold), key="check_all")
+        
+        with sel_col5:
+            st.markdown("**Display Mode:**")
+        with sel_col6:
+            display_mode = st.radio("Display Mode", ["Raw", "Transformed"], horizontal=True, key="series_display_mode", label_visibility="collapsed")
+
 
         # Load raw data and appendix
         df_full, transform_codes = load_full_fred_md_raw()
         appendix = load_fred_appendix()
         
-        active_series = set()
+        active_series = {} # series_name -> max_abs_importance (Weight)
         
-        # If any specific asset is checked, we identify the top 10 impactful stable drivers
+        # If any specific asset is checked, we identify the top impactful stable drivers
         selected_assets = []
         if f_equity: selected_assets.append('EQUITY')
         if f_bonds: selected_assets.append('BONDS')
         if f_gold: selected_assets.append('GOLD')
 
-        if selected_assets and not f_all:
+        if selected_assets:
             for asset in selected_assets:
                 attr = driver_attributions[asset]
                 stable_feats = stability_results_map[asset].get('stable_features', [])
                 # Only stable features
                 stable_attr = attr[attr['feature'].isin(stable_feats)].copy()
-                # Sort by absolute impact and take top 10
-                stable_attr['AbsImpact'] = stable_attr['Impact'].abs()
-                top_impactful = stable_attr.sort_values('AbsImpact', ascending=False).head(10)['feature'].tolist()
+                # Sort by absolute weight (Feature Importance)
+                stable_attr['AbsWeight'] = stable_attr['Weight'].abs()
                 
-                # Map features (e.g., 'PAYEMS_level') back to original series names ('PAYEMS')
-                for feat in top_impactful:
+                # Take all drivers for that asset and update their max importance
+                for _, row in stable_attr.iterrows():
+                    feat = row['feature']
+                    weight = row['AbsWeight']
+                    
+                    # Map feature back to original series name
                     for col in df_full.columns:
                         if feat.startswith(col + "_") or feat == col:
-                            active_series.add(col)
+                            if col not in active_series or weight > active_series[col]:
+                                active_series[col] = weight
                             break
+            # Sort by absolute weight and take top 15
+            sorted_by_importance = sorted(active_series.items(), key=lambda x: x[1], reverse=True)
+            sorted_series = [s[0] for s in sorted_by_importance[:15]]
         else:
-            active_series = set(df_full.columns)
+            # Sort all available series alphabetically
+            sorted_series = sorted(list(df_full.columns))
         
-        if not df_full.empty:
-            # Group definitions from appendix
-            group_names = {
-                1: "Output and Income",
-                2: "Labor Market",
-                3: "Housing",
-                4: "Consumption, Orders and Inventories",
-                5: "Money and Credit",
-                6: "Interest Rates and Exchange Rates",
-                7: "Prices",
-                8: "Stock Market"
-            }
+        if not df_full.empty and sorted_series:
+            num_series = len(sorted_series)
             
-            # Map columns to groups (Case-Insensitive)
-            columns_by_group = {}
-            for col in df_full.columns:
-                group_id = 0
-                col_upper = col.upper()
-                if col_upper in appendix.index:
-                    try:
-                        group_val = appendix.loc[col_upper, 'group']
-                        group_id = int(group_val) if not isinstance(group_val, pd.Series) else int(group_val.iloc[0])
-                    except:
-                        pass
-                
-                if group_id not in columns_by_group:
-                    columns_by_group[group_id] = []
-                columns_by_group[group_id].append(col)
-                
-            sorted_groups = sorted(columns_by_group.keys())
+            # Create subplots with ABSOLUTE zero spacing and no external titles
+            fig = make_subplots(
+                rows=num_series, 
+                cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0 # True zero spacing for a contiguous vertical area
+            )
             
-            for g_id in sorted_groups:
-                # Filter columns in this group based on active series selection
-                group_cols = columns_by_group[g_id]
-                group_cols = [c for c in group_cols if c in active_series]
+            for i, col in enumerate(sorted_series):
+                row = i + 1
+                tcode = 1
+                if col in transform_codes.index:
+                    try: tcode = int(transform_codes[col])
+                    except: pass
                 
-                if not group_cols:
-                    continue
+                raw_data = df_full[col].dropna()
+                data = raw_data if display_mode == "Raw" else apply_transformation(raw_data, tcode).dropna()
+                
+                if data.empty: continue
+                
+                # Get description for hover
+                desc = col
+                if col.upper() in appendix.index:
+                    series_info = appendix.loc[col.upper()]
+                    desc_str = series_info['description'] if isinstance(series_info, pd.Series) else series_info.iloc[0]['description']
+                    desc = f"{col}: {desc_str}"
+                
+                color = '#4da6ff' if display_mode == "Raw" else '#ff4757'
+                
+                # Append transformation to name if in Transformed mode
+                display_name = col
+                if display_mode == "Transformed":
+                    label = TRANSFORMATION_LABELS.get(tcode, "Unknown")
+                    display_name = f"{col} ({label})"
 
-                # Standard FRED-MD groups are 1-8. Group 0 is for anything uncategorized.
-                if g_id == 0:
-                    g_name = "Uncategorized / Miscellaneous"
-                else:
-                    g_name = group_names.get(g_id, f"Group {g_id}")
+                fig.add_trace(
+                    go.Scatter(
+                        x=data.index, 
+                        y=data.values,
+                        mode='lines',
+                        name=display_name,
+                        line=dict(color=color, width=1.5),
+                        hovertemplate=f'<b>{display_name}</b><br>%{{x|%b %Y}}<br>Value: %{{y:.4f}}<extra>{desc}</extra>'
+                    ),
+                    row=row, col=1
+                )
                 
-                st.markdown(f'<div class="panel-header" style="font-size: 1rem; color: #ff6b35; border-bottom: 1px solid #2a2a2a; margin: 1.5rem 0 1rem 0;">GROUP {g_id}: {g_name.upper()}</div>', unsafe_allow_html=True)
-                
-                for col in group_cols:
-                    # Get description from appendix (Case-Insensitive)
-                    desc = col
-                    col_upper = col.upper()
-                    if col_upper in appendix.index:
-                        series_info = appendix.loc[col_upper]
-                        desc_str = series_info['description'] if isinstance(series_info, pd.Series) else series_info.iloc[0]['description']
-                        desc = f"{col}: {desc_str}"
-                    
-                    with st.expander(desc):
-                        tcode = 1
-                        if col in transform_codes.index:
-                            try:
-                                tcode = int(transform_codes[col])
-                            except:
-                                pass
-                        
-                        raw_data = df_full[col].dropna()
-                        trans_data = apply_transformation(raw_data, tcode).dropna()
-                        
-                        # Stats display
-                        st.plotly_chart(
-                            plot_fred_series(raw_data, f"RAW: {col}", "LEVEL DATA", is_transformed=False),
-                            width='stretch', config={'displayModeBar': False}
-                        )
-                        st.plotly_chart(
-                            plot_fred_series(trans_data, f"TRANSFORMED: {col}", get_transformation_label(tcode), is_transformed=True),
-                            width='stretch', config={'displayModeBar': False}
-                        )
+                # Add Internal Title (Annotation)
+                fig.add_annotation(
+                    text=f"<b>{display_name}</b>",
+                    xref=f"x{row if row > 1 else ''} domain", yref=f"y{row if row > 1 else ''} domain",
+                    x=0.01, y=0.95,
+                    showarrow=False,
+                    font=dict(color='#ff6b35', size=11, family='IBM Plex Mono'),
+                    bgcolor='rgba(0,0,0,0.6)',
+                    bordercolor='#2a2a2a',
+                    borderwidth=1,
+                    align='left'
+                )
+
+                # Add Recession Bands to each subplot
+                for start, end in NBER_RECESSIONS:
+                    fig.add_vrect(
+                        x0=start, x1=end,
+                        fillcolor="#ffffff", opacity=0.07,
+                        layer="below", line_width=0,
+                        row=row, col=1
+                    )
+            
+            theme = create_theme()
+            # Synchronize axes styling with high-visibility cross-subplot spikelines
+            fig.update_xaxes(
+                **theme['xaxis'],
+                showspikes=True,
+                spikemode='across', # Force the line across subplot gaps
+                spikesnap='cursor',
+                spikedash='solid',
+                spikecolor='rgba(255,255,255,0.8)', # Prominent white line
+                spikethickness=1,
+                showticklabels=False
+            )
+            # Only show ticks on the bottom-most plot
+            fig.update_xaxes(showticklabels=True, row=num_series, col=1)
+            
+            fig.update_yaxes(**theme['yaxis'])
+
+            fig.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=40, r=20, t=10, b=40),
+                height=150 * num_series, # High density
+                showlegend=False,
+                hovermode='x', # Better for individual subplot spikeline triggers in zero-gap
+                hoverdistance=-1,
+                spikedistance=-1
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            
+            if len(active_series) > 15:
+                st.warning(f"Displaying {len(active_series)} series. Use asset filters to focus on key drivers.")
 
     with tab4:
         asset_to_plot = st.selectbox("Select Asset", ['EQUITY', 'BONDS', 'GOLD'], key="backtest_asset_select")
