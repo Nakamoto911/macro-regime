@@ -2074,7 +2074,10 @@ def main():
         with sel_col5:
             st.markdown("**Display Mode:**")
         with sel_col6:
-            display_mode = st.radio("Display Mode", ["Raw", "Transformed"], horizontal=True, key="series_display_mode", label_visibility="collapsed")
+            display_mode = st.radio("Display Mode", ["Raw", "Transformed", "Normalized"], horizontal=True, key="series_display_mode", label_visibility="collapsed")
+
+        if display_mode == "Normalized":
+            st.info("💡 **Normalized Mode**: Displays point-in-time Z-scores using an expanding window (no look-ahead bias), with values clipped at ±3.0 standard deviations for optimal readability.")
 
 
         # Load raw data and appendix
@@ -2135,7 +2138,19 @@ def main():
                     except: pass
                 
                 raw_data = df_full[col].dropna()
-                data = raw_data if display_mode == "Raw" else apply_transformation(raw_data, tcode).dropna()
+                if display_mode == "Raw":
+                    data = raw_data
+                else:
+                    data = apply_transformation(raw_data, tcode).dropna()
+                    if display_mode == "Normalized" and not data.empty:
+                        # Expanding window z-score (point-in-time vision)
+                        # We use a 12-month minimum window to establish a stable mean/std
+                        means = data.expanding(min_periods=12).mean()
+                        stds = data.expanding(min_periods=12).std()
+                        data = (data - means) / stds
+                        
+                        # Winsorization (Clip at +/- 3.0 for readability)
+                        data = data.clip(-3.0, 3.0)
                 
                 if data.empty: continue
                 
@@ -2146,13 +2161,15 @@ def main():
                     desc_str = series_info['description'] if isinstance(series_info, pd.Series) else series_info.iloc[0]['description']
                     desc = f"{col}: {desc_str}"
                 
-                color = '#4da6ff' if display_mode == "Raw" else '#ff4757'
-                
-                # Append transformation to name if in Transformed mode
+                # Append transformation to name if in Transformed/Normalized mode
                 display_name = col
-                if display_mode == "Transformed":
+                if display_mode in ["Transformed", "Normalized"]:
                     label = TRANSFORMATION_LABELS.get(tcode, "Unknown")
                     display_name = f"{col} ({label})"
+                    if display_mode == "Normalized":
+                        display_name += " [Z]"
+
+                color = '#4da6ff' if display_mode == "Raw" else '#ff4757' if display_mode == "Transformed" else '#00d26a'
 
                 fig.add_trace(
                     go.Scatter(
