@@ -1507,17 +1507,22 @@ def plot_backtest(actual_returns: pd.Series,
                   confidence_upper: pd.Series,
                   confidence_level: float = 0.90) -> go.Figure:
     """
-    Plot predicted vs actual forward returns.
+    Plot predicted vs actual forward returns with bottom-anchored minimal hover labels.
     """
     fig = go.Figure()
     
+    # Calculate CI margin for hover
+    ci_margin = (confidence_upper - confidence_lower) / 2
+    
+    # 1. VISIBLE TRACES (Hover Disabled)
     # Confidence band
     fig.add_trace(go.Scatter(
         x=predicted_returns.index,
         y=confidence_upper,
         mode='lines',
         line=dict(width=0),
-        showlegend=False
+        showlegend=False,
+        hoverinfo='skip'
     ))
     fig.add_trace(go.Scatter(
         x=predicted_returns.index,
@@ -1526,7 +1531,8 @@ def plot_backtest(actual_returns: pd.Series,
         line=dict(width=0),
         fill='tonexty',
         fillcolor='rgba(77, 166, 255, 0.2)',
-        name=f'{int(confidence_level*100)}% CI'
+        name=f'{int(confidence_level*100)}% CI',
+        hoverinfo='skip'
     ))
     
     # Predicted
@@ -1535,7 +1541,8 @@ def plot_backtest(actual_returns: pd.Series,
         y=predicted_returns,
         mode='lines',
         line=dict(color='#4da6ff', width=2),
-        name='Predicted'
+        name='Predicted',
+        hoverinfo='skip'
     ))
     
     # Actual
@@ -1544,7 +1551,38 @@ def plot_backtest(actual_returns: pd.Series,
         y=actual_returns,
         mode='lines',
         line=dict(color='#ff6b35', width=2),
-        name='Actual'
+        name='Actual',
+        hoverinfo='skip'
+    ))
+    
+    # 2. GHOST HOVER TRACES (Anchored at Bottom)
+    # Using a secondary hidden y-axis [0, 1] to pin labels to the bottom (y=0.05)
+    hover_y = 0.05
+    
+    # Pred Hover
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=[hover_y] * len(predicted_returns),
+        yaxis='y2',
+        name='Pred',
+        mode='markers',
+        marker=dict(size=0, opacity=0),
+        showlegend=False,
+        hovertemplate="<b>Pred</b>: %{customdata:.1%}<extra></extra>",
+        customdata=predicted_returns
+    ))
+    
+    # Act Hover
+    fig.add_trace(go.Scatter(
+        x=actual_returns.index,
+        y=[hover_y] * len(actual_returns),
+        yaxis='y2',
+        name='Act',
+        mode='markers',
+        marker=dict(size=0, opacity=0),
+        showlegend=False,
+        hovertemplate="<b>Act</b>: %{customdata:.1%}<extra></extra>",
+        customdata=actual_returns
     ))
     
     theme = create_theme()
@@ -1553,8 +1591,27 @@ def plot_backtest(actual_returns: pd.Series,
         plot_bgcolor=theme['plot_bgcolor'],
         margin=dict(l=50, r=20, t=30, b=40),
         height=350,
-        xaxis=dict(gridcolor='#1a1a1a'),
+        hovermode='x',
+        hoverlabel=dict(
+            bgcolor='rgba(0,0,0,0.6)',
+            font=dict(family='IBM Plex Mono', size=11)
+        ),
+        xaxis=dict(
+            gridcolor='#1a1a1a',
+            showspikes=True,
+            spikemode='across',
+            spikesnap='cursor',
+            spikedash='dash',
+            spikethickness=1,
+            spikecolor='#555'
+        ),
         yaxis=dict(gridcolor='#1a1a1a', title='Annualized Return'),
+        yaxis2=dict(
+            range=[0, 1],
+            overlaying='y',
+            visible=False,
+            fixedrange=True
+        ),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0)
     )
     
