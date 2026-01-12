@@ -2025,8 +2025,8 @@ def main():
                 stable_feats = stability_results_map[asset].get('stable_features', [])
                 attr = attr[attr['feature'].isin(stable_feats)].copy()
                 # Add absolute impact for sorting if needed, but we keep Impact column
-                attr['AbsImpact'] = attr['Impact'].abs()
-                attr = attr.sort_values('AbsImpact', ascending=False)
+                attr['AbsWeight'] = attr['Weight'].abs()
+                attr = attr.sort_values('AbsWeight', ascending=False)
 
                 selection = st.dataframe(
                     attr[['feature', 'Signal', 'Impact', 'Weight', 'State', 'Link']], 
