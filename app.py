@@ -1,24 +1,28 @@
 """
-High-Dimensional Adaptive Sparse Elastic Net VECM
-Strategic Asset Allocation System
+VECM Strategic Asset Allocation System - V3
+Forward Return Prediction Model (12-Month Horizon)
 
 Target: US Equities / Bonds / Gold
-Horizon: 5-10 years
-Methodology: Adaptive Sparse VECM with Elastic Net, Kernel Dictionary, and Regime Sentinel
+Methodology: Annualized Forward Returns ~ Macro State Features
+Estimation: Robust Huber Regression + Stability Selection
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from yahooquery import Ticker
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNet, ElasticNetCV, LinearRegression, HuberRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from sklearn.model_selection import TimeSeriesSplit
+from statsmodels.regression.linear_model import OLS
+from statsmodels.stats.sandwich_covariance import cov_hac
+from scipy.stats import t
 import pandas_datareader.data as web
+import warnings
+warnings.filterwarnings('ignore')
 
 # NBER Recession Dates (approximate for FRED-MD plotting)
 NBER_RECESSIONS = [
@@ -33,350 +37,717 @@ NBER_RECESSIONS = [
     ('2020-02-01', '2020-04-01')
 ]
 
-# Page configuration
-st.set_page_config(
-    page_title="VECM Strategic Allocation",
-    page_icon="◈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+TRANSFORMATION_LABELS = {
+    1: "Level",
+    2: "Δ",
+    3: "Δ²",
+    4: "log",
+    5: "Δlog",
+    6: "Δ²log",
+    7: "Δpct"
+}
 
-# Custom CSS for Bloomberg Terminal-inspired dark theme
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
-    
-    :root {
-        --bg-primary: #0a0a0a;
-        --bg-secondary: #111111;
-        --bg-tertiary: #1a1a1a;
-        --border-color: #2a2a2a;
-        --text-primary: #e8e8e8;
-        --text-secondary: #888888;
-        --text-muted: #555555;
-        --accent-orange: #ff6b35;
-        --accent-green: #00d26a;
-        --accent-red: #ff4757;
-        --accent-blue: #4da6ff;
-        --accent-gold: #ffd700;
-    }
-    
-    .stApp {
-        background-color: var(--bg-primary);
-        font-family: 'IBM Plex Sans', sans-serif;
-    }
-    
-    .main .block-container {
-        padding: 1rem 2rem;
-        max-width: 100%;
-    }
-    
-    /* Header styling */
-    .header-container {
-        background: linear-gradient(180deg, #111111 0%, #0a0a0a 100%);
-        border-bottom: 1px solid var(--border-color);
-        padding: 1rem 0;
-        margin-bottom: 1.5rem;
-    }
-    
-    .header-title {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: var(--accent-orange);
-        letter-spacing: 0.5px;
-        margin: 0;
-    }
-    
-    .header-subtitle {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.75rem;
-        color: var(--text-secondary);
-        letter-spacing: 1px;
-        margin-top: 0.25rem;
-    }
-    
-    /* Panel styling */
-    .panel {
-        background-color: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 2px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-    }
-    
-    .panel-header {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.7rem;
-        font-weight: 600;
-        color: var(--text-secondary);
-        letter-spacing: 1.5px;
-        text-transform: uppercase;
-        border-bottom: 1px solid var(--border-color);
-        padding-bottom: 0.5rem;
-        margin-bottom: 0.75rem;
-    }
-    
-    /* Metric cards */
-    .metric-card {
-        background-color: var(--bg-tertiary);
-        border: 1px solid var(--border-color);
-        border-radius: 2px;
-        padding: 0.75rem;
-        text-align: center;
-    }
-    
-    .metric-label {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.65rem;
-        color: var(--text-muted);
-        letter-spacing: 1px;
-        text-transform: uppercase;
-    }
-    
-    .metric-value {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 1.25rem;
-        font-weight: 600;
-        color: var(--text-primary);
-        margin-top: 0.25rem;
-    }
-    
-    .metric-value.positive { color: var(--accent-green); }
-    .metric-value.negative { color: var(--accent-red); }
-    .metric-value.warning { color: var(--accent-orange); }
-    .metric-value.gold { color: var(--accent-gold); }
-    
-    /* Status indicators */
-    .status-indicator {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.75rem;
-        padding: 0.25rem 0.5rem;
-        border-radius: 2px;
-    }
-    
-    .status-calm {
-        background-color: rgba(0, 210, 106, 0.1);
-        color: var(--accent-green);
-        border: 1px solid rgba(0, 210, 106, 0.3);
-    }
-    
-    .status-alert {
-        background-color: rgba(255, 71, 87, 0.1);
-        color: var(--accent-red);
-        border: 1px solid rgba(255, 71, 87, 0.3);
-    }
-    
-    .status-warning {
-        background-color: rgba(255, 107, 53, 0.1);
-        color: var(--accent-orange);
-        border: 1px solid rgba(255, 107, 53, 0.3);
-    }
-    
-    /* Table styling */
-    .data-table {
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.75rem;
-        width: 100%;
-        border-collapse: collapse;
-    }
-    
-    .data-table th {
-        background-color: var(--bg-tertiary);
-        color: var(--text-secondary);
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        padding: 0.5rem;
-        border-bottom: 1px solid var(--border-color);
-        text-align: left;
-    }
-    
-    .data-table td {
-        color: var(--text-primary);
-        padding: 0.5rem;
-        border-bottom: 1px solid var(--border-color);
-    }
-    
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background-color: var(--bg-secondary);
-        border-right: 1px solid var(--border-color);
-    }
-    
-    section[data-testid="stSidebar"] .stMarkdown {
-        color: var(--text-primary);
-    }
-    
-    /* Hide Streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* Custom scrollbar */
-    ::-webkit-scrollbar {
-        width: 6px;
-        height: 6px;
-    }
-    
-    ::-webkit-scrollbar-track {
-        background: var(--bg-primary);
-    }
-    
-    ::-webkit-scrollbar-thumb {
-        background: var(--border-color);
-        border-radius: 3px;
-    }
-    
-    /* Streamlit element overrides */
-    .stSelectbox > div > div {
-        background-color: var(--bg-tertiary);
-        border-color: var(--border-color);
-    }
-    
-    .stSlider > div > div > div {
-        background-color: var(--accent-orange);
-    }
-    
-    .stButton > button {
-        background-color: var(--bg-tertiary);
-        border: 1px solid var(--border-color);
-        color: var(--text-primary);
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.75rem;
-        letter-spacing: 0.5px;
-        transition: all 0.2s;
-    }
-    
-    .stButton > button:hover {
-        background-color: var(--accent-orange);
-        border-color: var(--accent-orange);
-        color: #000;
-    }
-    
-    .stTabs [data-baseweb="tab-list"] {
-        background-color: var(--bg-secondary);
-        gap: 0;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        background-color: var(--bg-tertiary);
-        border: 1px solid var(--border-color);
-        color: var(--text-secondary);
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.7rem;
-        letter-spacing: 1px;
-        padding: 0 20px;
-    }
-    
-    .stTabs [aria-selected="true"] {
-        background-color: var(--bg-primary);
-        color: var(--accent-orange);
-        border-bottom-color: var(--bg-primary);
-    }
-    
-    div[data-testid="stExpander"] {
-        background-color: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-    }
-    
-    .stProgress > div > div > div > div {
-        background-color: var(--accent-orange);
-    }
-</style>
-""", unsafe_allow_html=True)
+# Streamlit Setup moved to main()
+
+# CSS moved to main()
 
 
 # ============================================================================
-# DATA GENERATION & SIMULATION
+# DATA PIPELINE
+# ============================================================================
+
+def compute_forward_returns(prices: pd.DataFrame, horizon_months: int = 12) -> pd.DataFrame:
+    """
+    Compute annualized forward returns for each asset.
+    """
+    log_prices = np.log(prices)
+    forward_log_return = log_prices.shift(-horizon_months) - log_prices
+    annualized_return = forward_log_return / (horizon_months / 12)
+    return annualized_return
+
+
+def prepare_macro_features(macro_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform macro variables into current-state features.
+    No forward-looking information used.
+    """
+    features = pd.DataFrame(index=macro_data.index)
+    
+    for col in macro_data.columns:
+        series = macro_data[col]
+        
+        # Level
+        features[f'{col}_level'] = series
+        
+        # Moving averages
+        features[f'{col}_MA12'] = series.rolling(12).mean()
+        features[f'{col}_MA60'] = series.rolling(60).mean()
+        
+        # Z-score vs 5Y average
+        ma60 = series.rolling(60).mean()
+        std60 = series.rolling(60).std()
+        features[f'{col}_zscore'] = (series - ma60) / std60
+        
+        # Percentile rank (rolling 10Y window)
+        features[f'{col}_pctl'] = series.rolling(120).apply(
+            lambda x: (x < x.iloc[-1]).sum() / len(x), raw=False
+        )
+        
+        # Momentum / slope
+        ma12 = series.rolling(12).mean()
+        std = series.rolling(60).std()
+        features[f'{col}_slope12'] = (ma12 - ma12.shift(12)) / std
+        features[f'{col}_slope60'] = (ma60 - ma60.shift(60)) / std
+    
+    return features.dropna()
+
+
 # ============================================================================
 
 @st.cache_data(ttl=3600)
-def load_fred_md_data_safe(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
-    """Load and process FRED-MD data from CSV (Safe Version)."""
+def get_series_descriptions(file_path: str = 'FRED-MD_updated_appendix.csv') -> dict:
+    """Load series descriptions from appendix."""
     try:
-        # Load data (row 0 contains transformation codes)
+        df = pd.read_csv(file_path, encoding='latin1')
+        # Create mapping from fred ID to description
+        mapping = dict(zip(df['fred'], df['description']))
+        # Add some manual mappings for derived variables if any
+        mapping['SPREAD'] = '10Y Treasury - Fed Funds Spread'
+        mapping['BAA_AAA'] = 'Baa - Aaa Corporate Bond Spread'
+        mapping['CAPACITY'] = 'Capacity Utilization: Manufacturing'
+        return mapping
+    except Exception as e:
+        st.warning(f"Could not load series descriptions: {e}")
+        return {}
+
+
+@st.cache_data(ttl=3600)
+def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
+    """Load and process FRED-MD data for specified macro variables."""
+    try:
         df_raw = pd.read_csv(file_path)
-        
-        # Extract transformation codes (first row) and data
-        transform_codes = df_raw.iloc[0]
         df = df_raw.iloc[1:].copy()
-        
-        # Parse dates and ensure they are timezone-naive
         df['sasdate'] = pd.to_datetime(df['sasdate'], utc=True).dt.tz_localize(None)
         df = df.set_index('sasdate')
         
-        # Convert all columns to numeric
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
             
-        # Select and Construct Variables
+        # Core Macro Variables from Spec
+        mapping = {
+            'PAYEMS': 'PAYEMS',     # Labor
+            'UNRATE': 'UNRATE',     # Labor
+            'INDPRO': 'INDPRO',     # Output
+            'CUMFNS': 'CAPACITY',   # Output
+            'CPIAUCSL': 'CPI',      # Prices
+            'WPSFD49207': 'PPI',    # Prices
+            'PCEPI': 'PCE',         # Prices
+            'FEDFUNDS': 'FEDFUNDS', # Rates
+            'GS10': 'GS10',         # Rates
+            'HOUST': 'HOUST',       # Housing
+            'M2SL': 'M2'            # Money
+        }
+        
         data = pd.DataFrame(index=df.index)
+        for fred_col, target_col in mapping.items():
+            if fred_col in df.columns:
+                data[target_col] = df[fred_col]
         
-        # 1. Labor Market
-        data['PAYEMS'] = df['PAYEMS']
-        data['USPRIV'] = df['PAYEMS'] - df['USGOVT']
-        data['UNRATE'] = df['UNRATE']
+        # Derived Financial Variables
+        if 'GS10' in data.columns and 'FEDFUNDS' in data.columns:
+            data['SPREAD'] = data['GS10'] - data['FEDFUNDS']
         
-        # 2. Output & Production
-        data['INDPRO'] = df['INDPRO']
-        data['IPFINAL'] = df['IPFINAL']
-        data['CAPACITY'] = df['CUMFNS'] # Capacity Utilization
+        if 'BAA' in df.columns and 'AAA' in df.columns:
+            data['BAA_AAA'] = df['BAA'] - df['AAA']
+            
+        # Apply log transformations where appropriate (Spec says keep core variables, 
+        # but apply transformations in prepare_macro_features. 
+        # However, level variables like INDPRO/CPI/etc usually need log-level or log-diff.
+        # Spec says {VAR}_level = X_t. I'll stick to logs for index-like variables as per previous logic
+        # but the spec doesn't explicitly say log. I'll log transform them here to keep consistency
+        # with standard macro modelling when using levels of prices/indices.)
+        log_vars = ['PAYEMS', 'INDPRO', 'CPI', 'PPI', 'PCE', 'HOUST', 'M2']
+        for col in log_vars:
+            if col in data.columns:
+                data[col] = np.log(data[col].replace(0, np.nan))
         
-        # 3. Prices
-        data['CPI'] = df['CPIAUCSL']
-        data['PPI'] = df['WPSFD49207'] # PPI Finished Goods
-        data['PCE'] = df['PCEPI']
-        
-        # 4. Financial Rates
-        data['FEDFUNDS'] = df['FEDFUNDS']
-        data['GS10'] = df['GS10']
-        data['SPREAD'] = df['GS10'] - df['FEDFUNDS']
-        
-        # 5. Credit & Housing
-        data['BAA_AAA'] = df['BAA'] - df['AAA']
-        data['HOUST'] = df['HOUST']
-        
-        # 6. Money Supply
-        data['M2'] = df['M2SL']
-        
-        # Apply Transformations (Log Levels for growth/level vars)
-        # We use the FRED-MD codes to decide: usually codes 4, 5, 6 imply logs
-        for col_name, source_col in [
-            ('PAYEMS', 'PAYEMS'), 
-            ('USPRIV', 'PAYEMS'), # Base is PAYEMS which is log
-            ('INDPRO', 'INDPRO'),
-            ('IPFINAL', 'IPFINAL'),
-            ('CPI', 'CPIAUCSL'),
-            ('PPI', 'WPSFD49207'),
-            ('PCE', 'PCEPI'),
-            ('HOUST', 'HOUST'),
-            ('M2', 'M2SL')
-        ]:
-            if source_col in transform_codes:
-                try:
-                    code = float(transform_codes[source_col])
-                    if code in [4, 5, 6]:
-                        data[col_name] = np.log(data[col_name])
-                except Exception:
-                    pass
-                    
-        # Capacity is usually a percentage, keep as level or divide by 100? 
-        # FRED code is 1 or 2 usually. We keep as is.
-        
-        # Final cleaning for stability with aggressive clipping
-        # Macro data should typically not exceed these bounds (e.g. log levels or growth rates)
         data = data.replace([np.inf, -np.inf], np.nan).dropna()
-        data = data.clip(lower=-1e9, upper=1e9)
         return data
         
     except Exception as e:
         st.error(f"Error loading FRED-MD data: {e}")
-        # Fallback for resiliency if file missing during dev
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def load_asset_data(start_date: str = '1960-01-01') -> pd.DataFrame:
+    """Load long history asset prices."""
+    
+    # EQUITIES from FRED-MD (S&P 500)
+    equity_prices = pd.Series(dtype=float)
+    try:
+        df_macro_raw = pd.read_csv('2025-11-MD.csv').iloc[1:]
+        df_macro_raw['sasdate'] = pd.to_datetime(df_macro_raw['sasdate'], utc=True).dt.tz_localize(None)
+        df_macro_raw.set_index('sasdate', inplace=True)
+        
+        if 'S&P 500' in df_macro_raw.columns:
+            equity_prices = pd.to_numeric(df_macro_raw['S&P 500'], errors='coerce').dropna()
+    except Exception as e:
+        st.warning(f"Equity data error: {e}")
+
+    # GOLD - using PPI for Gold (WPU1022) as long-term proxy
+    gold_prices = pd.Series(dtype=float)
+    try:
+        gold_ppi = web.DataReader('WPU1022', 'fred', start_date)
+        gold_ppi.index = pd.to_datetime(gold_ppi.index, utc=True).tz_localize(None)
+        gold_ppi = gold_ppi.resample('MS').last()
+        gold_prices = gold_ppi['WPU1022'].dropna()
+    except Exception as e:
+        st.warning(f"Gold data error: {e}")
+
+    # BONDS - synthetic total return from GS10
+    bond_prices = pd.Series(dtype=float)
+    try:
+        gs10 = web.DataReader('GS10', 'fred', start_date)
+        gs10.index = pd.to_datetime(gs10.index, utc=True).tz_localize(None)
+        yields = gs10['GS10'] / 100
+        duration = 7.5
+        # Calculate monthly total returns
+        carry = yields.shift(1) / 12
+        price_change = -duration * (yields - yields.shift(1))
+        synth_ret = carry + price_change
+        # Convert returns to index
+        bond_prices = 100 * (1 + synth_ret.fillna(0)).cumprod()
+    except Exception as e:
+        st.warning(f"Bond data error: {e}")
+
+    df_prices = pd.DataFrame({
+        'EQUITY': equity_prices,
+        'GOLD': gold_prices,
+        'BONDS': bond_prices
+    }).dropna()
+    
+    return df_prices
+
+
+# ============================================================================
+# MODEL COMPONENTS
+# ============================================================================
+
+class Winsorizer:
+    """
+    Caps features at a specific Z-score threshold.
+    Aligned with benchmarking_engine.py
+    """
+    def __init__(self, threshold=3.0):
+        self.threshold = threshold
+        self.means_ = None
+        self.stds_ = None
+
+    def fit(self, X, y=None):
+        X_df = pd.DataFrame(X)
+        self.means_ = X_df.mean()
+        self.stds_ = X_df.std()
+        return self
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
+
+    def transform(self, X):
+        X_df = pd.DataFrame(X).copy()
+        for col in X_df.columns:
+            # Handle possible division by zero or NaN std
+            std = self.stds_[col] if self.stds_[col] > 1e-9 else 1e-9
+            z_score = (X_df[col] - self.means_[col]) / std
+            X_df[col] = X_df[col].mask(z_score > self.threshold, self.means_[col] + self.threshold * std)
+            X_df[col] = X_df[col].mask(z_score < -self.threshold, self.means_[col] - self.threshold * std)
+        return X_df
+
+# ============================================================================
+# ESTIMATION LOGIC
+# ============================================================================
+
+def estimate_with_hac(y: pd.Series, X: pd.DataFrame, lag: int = 11) -> dict:
+    """
+    OLS estimation with Newey-West HAC standard errors.
+    """
+    # Add constant for OLS
+    import statsmodels.api as sm
+    X_const = sm.add_constant(X)
+    model = sm.OLS(y, X_const).fit(cov_type='HAC', cov_kwds={'maxlags': lag})
+    return {
+        'model': model,
+        'coefficients': model.params,
+        'std_errors': model.bse,
+        't_stats': model.tvalues,
+        'p_values': model.pvalues,
+        'r_squared': model.rsquared,
+        'resid': model.resid
+    }
+
+
+def estimate_robust(y: pd.Series, X: pd.DataFrame) -> dict:
+    """
+    Robust regression (Huber) that is less sensitive to outliers (like 2008 or 2020).
+    Replaces standard OLS for stability.
+    """
+    from sklearn.linear_model import HuberRegressor
+    
+    # 1. Robust Scaling (Winsorization)
+    # Cap features at roughly 3 standard deviations (1% and 99% quantiles) to prevent explosions
+    X_clipped = X.clip(lower=X.quantile(0.01), upper=X.quantile(0.99), axis=1)
+    
+    # 2. Fit Huber Regressor
+    # epsilon=1.35 is standard for 95% efficiency on normal data
+    model = HuberRegressor(epsilon=1.35, max_iter=200)
+    model.fit(X_clipped, y)
+    
+    return {
+        'model': model,
+        'coefficients': pd.Series(model.coef_, index=X.columns),
+        'intercept': model.intercept_,
+        'fitted_values': model.predict(X_clipped)
+    }
+
+
+@st.cache_data(show_spinner=False)
+def select_features_elastic_net(y: pd.Series, X: pd.DataFrame, 
+                                 n_iterations: int = 50,
+                                 sample_fraction: float = 0.7,
+                                 threshold: float = 0.7,
+                                 l1_ratio: float = 0.5) -> tuple:
+    """
+    Implement Stability Selection via bootstrapping.
+    """
+    from sklearn.linear_model import ElasticNet
+    
+    # Standardize
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+    
+    n_features = X.shape[1]
+    selection_counts = pd.Series(0, index=X.columns)
+    
+    # 1. Bootstrapping Loop
+    for _ in range(n_iterations):
+        # Subsample indices
+        sample_size = int(len(y) * sample_fraction)
+        indices = np.random.choice(len(y), size=sample_size, replace=False)
+        
+        y_sample = y.iloc[indices]
+        X_sample = X_scaled.iloc[indices]
+        
+        # Fit a simple ElasticNet (faster than CV for each bootstrap)
+        # We use a small alpha for selection
+        model = ElasticNet(alpha=0.01, l1_ratio=l1_ratio, max_iter=5000)
+        model.fit(X_sample, y_sample)
+        
+        # Record non-zero coefficients
+        selection_counts[model.coef_ != 0] += 1
+        
+    # 2. Calculate Probabilities
+    selection_probs = selection_counts / n_iterations
+    
+    # 3. Apply Threshold
+    selected = selection_probs[selection_probs > threshold].index.tolist()
+    
+    # 4. Fallback Logic: ensure at least one feature
+    if not selected and not selection_probs.empty:
+        selected = [selection_probs.idxmax()]
+    
+    return selected, selection_probs
+
+
+def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame, 
+                              min_train_months: int = 240, 
+                              horizon_months: int = 12,
+                              rebalance_freq: int = 12,
+                              asset_class: str = 'EQUITY') -> tuple:
+    """
+    Recursive walk-forward (expanding window) backtest.
+    Returns: (oos_results_df, selection_history_df)
+    """
+    import statsmodels.api as sm
+    from scipy.stats import t
+    
+    results = []
+    selection_history = []
+    dates = X.index
+    
+    start_idx = min_train_months + horizon_months
+    
+    if start_idx >= len(dates):
+        return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci']), pd.DataFrame()
+
+    for i in range(start_idx, len(dates), rebalance_freq):
+        current_date = dates[i]
+        
+        train_limit = current_date - pd.DateOffset(months=horizon_months)
+        train_mask = X.index <= train_limit
+        
+        X_train_all = X[train_mask]
+        y_train_all = y[train_mask].dropna()
+        X_train = X_train_all.loc[y_train_all.index]
+        
+        if len(y_train_all) < 60:
+            continue
+            
+        # Determine prediction window
+        end_window = min(i + rebalance_freq, len(dates))
+        predict_idx = dates[i : end_window]
+            
+        if asset_class == 'EQUITY':
+            # EQUITY: Random Forest on ALL features (mirrors benchmark)
+            # Benchmark start_idx=240, step=12, horizon=12
+            win = Winsorizer(threshold=3.0)
+            X_train_clean = win.fit_transform(X_train)
+            X_live_clean = win.transform(X.loc[predict_idx])
+            
+            model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42)
+            model.fit(X_train_clean, y_train_all)
+            
+            # Record selection (in RF, we can use importance as proxy)
+            importance = pd.Series(model.feature_importances_, index=X.columns)
+            selection_history.append({**importance.to_dict(), 'date': current_date})
+            
+            raw_preds = model.predict(X_live_clean)
+            pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
+            se = np.std(y_train_all - model.predict(X_train_clean))
+            n_features = X_train_clean.shape[1]
+
+        elif asset_class == 'BONDS':
+            # BONDS: ElasticNetCV on ALL features (mirrors benchmark)
+            win = Winsorizer(threshold=3.0)
+            X_train_clean = win.fit_transform(X_train)
+            X_live_clean = win.transform(X.loc[predict_idx])
+            
+            model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=5000)
+            model.fit(X_train_clean, y_train_all)
+            
+            # Record selection
+            coefs = pd.Series(model.coef_, index=X.columns)
+            selection_history.append({**coefs.to_dict(), 'date': current_date})
+            
+            raw_preds = model.predict(X_live_clean)
+            pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
+            se = np.std(y_train_all - model.predict(X_train_clean))
+            n_features = X_train_clean.shape[1]
+
+        else: # GOLD
+            # GOLD: Simple OLS on ALL features (mirrors benchmark)
+            win = Winsorizer(threshold=3.0)
+            X_train_clean = win.fit_transform(X_train)
+            X_live_clean = win.transform(X.loc[predict_idx])
+            
+            model = LinearRegression()
+            model.fit(X_train_clean, y_train_all)
+            
+            # Record selection
+            coefs = pd.Series(model.coef_, index=X.columns)
+            selection_history.append({**coefs.to_dict(), 'date': current_date})
+            
+            raw_preds = model.predict(X_live_clean)
+            pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
+            se = np.std(y_train_all - model.predict(X_train_clean))
+            n_features = X_train_clean.shape[1]
+        
+        t_crit = t.ppf(0.95, df=len(y_train_all)-n_features-1) if n_features > 0 else 1.66
+        
+        for date in predict_idx:
+            val = pred_vals.loc[date]
+            results.append({
+                'date': date,
+                'predicted_return': val,
+                'lower_ci': val - (t_crit * se),
+                'upper_ci': val + (t_crit * se)
+            })
+            
+    if not results:
+        return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci']), pd.DataFrame()
+        
+    oos_df = pd.DataFrame(results).set_index('date')
+    selection_df = pd.DataFrame(selection_history).set_index('date')
+    
+    return oos_df, selection_df
+
+
+@st.cache_data(show_spinner=False)
+def cached_walk_forward(y, X, min_train_months=240, horizon_months=12, rebalance_freq=12, asset_class='EQUITY'):
+    return run_walk_forward_backtest(y, X, min_train_months, horizon_months, rebalance_freq, asset_class)
+
+
+
+
+def time_series_cv(y: pd.Series, X: pd.DataFrame, n_splits: int = 5):
+    """
+    Time-series cross-validation for model selection.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=60)  # 60-month gap to avoid leakage
+    
+    scores = []
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        
+        if len(X_train) < 60: continue
+        
+        # Fit and evaluate
+        model = ElasticNet(l1_ratio=0.5, alpha=0.01)
+        # Scaler
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        model.fit(X_train_scaled, y_train)
+        score = model.score(X_test_scaled, y_test)
+        scores.append(score)
+    
+    return (np.mean(scores), np.std(scores)) if scores else (0.0, 0.0)
+
+
+@st.cache_data(show_spinner=False)
+def stability_analysis(y: pd.Series, X: pd.DataFrame, 
+                       horizon_months: int = 12,
+                       window_years: int = 25,
+                       step_years: int = 5) -> list:
+    """
+    Rolling window estimation for stability assessment.
+    """
+    window_months = window_years * 12
+    step_months = step_years * 12
+    
+    results = []
+    
+    for start in range(0, len(y) - window_months, step_months):
+        end = start + window_months
+        
+        y_window = y.iloc[start:end]
+        X_window = X.iloc[start:end]
+        
+        # Drop NaN (forward returns missing at end)
+        valid = y_window.notna()
+        y_valid = y_window[valid]
+        X_valid = X_window[valid]
+        
+        if len(y_valid) < 120:  # Minimum 10 years of valid data
+            continue
+        
+        # Estimate using Stability Selection
+        selected_features, selection_probs = select_features_elastic_net(y_valid, X_valid)
+        
+        # Fit OLS on selected features to get coefficients for stability analysis
+        if selected_features:
+            hac_res = estimate_with_hac(y_valid, X_valid[selected_features], lag=horizon_months//2)
+            coef_dict = hac_res['coefficients'].to_dict()
+        else:
+            coef_dict = {col: 0.0 for col in X.columns}
+        
+        results.append({
+            'start_date': y.index[start],
+            'end_date': y.index[end - 1],
+            'selected_features': selected_features,
+            'coefficients': coef_dict,
+            'n_selected': len(selected_features)
+        })
+    
+    return results
+
+
+def compute_stability_metrics(stability_results: list, feature_names: list) -> pd.DataFrame:
+    """
+    Compute stability metrics for each feature across estimation windows.
+    """
+    n_windows = len(stability_results)
+    if n_windows == 0:
+        return pd.DataFrame(columns=['feature', 'persistence', 'sign_consistency', 'magnitude_stability', 'mean_coefficient'])
+        
+    metrics = []
+    for feat in feature_names:
+        coefs = []
+        for result in stability_results:
+            if feat in result['coefficients']:
+                coefs.append(result['coefficients'][feat])
+        
+        coefs = np.array(coefs)
+        non_zero = coefs[coefs != 0]
+        
+        persistence = len(non_zero) / n_windows
+        
+        if len(non_zero) > 1:
+            sign_consistency = max(
+                (non_zero > 0).sum() / len(non_zero),
+                (non_zero < 0).sum() / len(non_zero)
+            )
+            cv = np.std(non_zero) / np.abs(np.mean(non_zero)) if np.mean(non_zero) != 0 else 999
+            magnitude_stability = 1 / (1 + cv)
+            mean_coef = np.mean(non_zero)
+        elif len(non_zero) == 1:
+            sign_consistency = 1.0
+            magnitude_stability = 1.0
+            mean_coef = non_zero[0]
+        else:
+            sign_consistency = 0.0
+            magnitude_stability = 0.0
+            mean_coef = 0.0
+        
+        metrics.append({
+            'feature': feat,
+            'persistence': persistence,
+            'sign_consistency': sign_consistency,
+            'magnitude_stability': magnitude_stability,
+            'mean_coefficient': mean_coef
+        })
+    
+    return pd.DataFrame(metrics)
+
+
+# ============================================================================
+# SIGNALS & ALLOCATION
+# ============================================================================
+
+def compute_expected_returns(macro_features_current: pd.Series,
+                              stable_coefficients: pd.Series,
+                              intercept: float) -> float:
+    """
+    Compute expected annualized return for an asset.
+    """
+    # Align features
+    common_features = stable_coefficients.index.intersection(macro_features_current.index)
+    
+    expected_return = intercept + (
+        macro_features_current[common_features] * stable_coefficients[common_features]
+    ).sum()
+    
+    return expected_return
+
+
+def compute_confidence_interval(expected_return: float,
+                                 prediction_std_error: float,
+                                 confidence: float = 0.90) -> tuple:
+    """
+    Compute confidence interval for expected return.
+    """
+    # Use t-distribution with large df (approximates normal)
+    t_crit = t.ppf((1 + confidence) / 2, df=100)
+    
+    lower = expected_return - t_crit * prediction_std_error
+    upper = expected_return + t_crit * prediction_std_error
+    
+    return lower, upper
+
+
+def compute_driver_attribution(macro_features_current: pd.Series,
+                                stable_coefficients: pd.Series,
+                                feature_means: pd.Series) -> pd.DataFrame:
+    """
+    Attribute expected return to each driver.
+    """
+    attributions = []
+    
+    for feat in stable_coefficients.index:
+        if feat not in macro_features_current.index:
+            continue
+        
+        current_val = macro_features_current[feat]
+        mean_val = feature_means.get(feat, 0)
+        coef = stable_coefficients[feat]
+        
+        # Contribution = coef × (current - mean)
+        contribution = coef * (current_val - mean_val)
+        
+        # Direction
+        if contribution > 0.005:
+            direction = 'TAILWIND'
+        elif contribution < -0.005:
+            direction = 'HEADWIND'
+        else:
+            direction = 'NEUTRAL'
+        
+        attributions.append({
+            'feature': feat,
+            'coefficient': coef,
+            'current_value': current_val,
+            'historical_mean': mean_val,
+            'deviation': current_val - mean_val,
+            'contribution': contribution,
+            'direction': direction
+        })
+    
+    return pd.DataFrame(attributions).sort_values('contribution', key=abs, ascending=False)
+
+
+def evaluate_regime(macro_data: pd.DataFrame, alert_threshold: float = 2.0) -> tuple:
+    """
+    Simplified regime detection for risk management.
+    """
+    recent = macro_data.tail(60)
+    indicators = {}
+    
+    # Credit stress
+    if 'BAA_AAA' in recent.columns:
+        spread_z = (recent['BAA_AAA'].iloc[-1] - recent['BAA_AAA'].mean()) / recent['BAA_AAA'].std()
+        indicators['credit'] = spread_z
+    else:
+        indicators['credit'] = 0
+    
+    # Yield curve
+    if 'SPREAD' in recent.columns:
+        curve_z = -(recent['SPREAD'].iloc[-1] - recent['SPREAD'].mean()) / recent['SPREAD'].std()
+        indicators['curve'] = curve_z
+    else:
+        indicators['curve'] = 0
+    
+    stress_score = 0.5 * indicators['credit'] + 0.5 * indicators['curve']
+    
+    if stress_score > alert_threshold:
+        status = "ALERT"
+    elif stress_score > alert_threshold * 0.6:
+        status = "WARNING"
+    else:
+        status = "CALM"
+        
+    return status, stress_score, indicators
+
+
+def compute_allocation(expected_returns: dict,
+                       confidence_intervals: dict,
+                       regime_status: str,
+                       risk_free_rate: float = 0.04) -> dict:
+    """
+    Compute target allocation based on expected returns.
+    """
+    # Base weights
+    base = {'EQUITY': 0.60, 'BONDS': 0.30, 'GOLD': 0.10}
+    min_w = {'EQUITY': 0.20, 'BONDS': 0.20, 'GOLD': 0.05}
+    max_w = {'EQUITY': 0.80, 'BONDS': 0.50, 'GOLD': 0.25}
+    
+    # Regime adjustment
+    if regime_status == 'ALERT':
+        regime_mult = {'EQUITY': 0.5, 'BONDS': 1.2, 'GOLD': 1.5}
+    elif regime_status == 'WARNING':
+        regime_mult = {'EQUITY': 0.75, 'BONDS': 1.1, 'GOLD': 1.25}
+    else:
+        regime_mult = {'EQUITY': 1.0, 'BONDS': 1.0, 'GOLD': 1.0}
+    
+    # Expected return adjustment
+    weights = {}
+    for asset in ['EQUITY', 'BONDS', 'GOLD']:
+        exp_ret = expected_returns.get(asset, 0.05)
+        excess_return = exp_ret - risk_free_rate
+        
+        # Scale: +1% excess return → +5% weight adjustment
+        return_adj = 1.0 + (excess_return * 5)
+        
+        # Combined adjustment
+        adj_weight = base[asset] * regime_mult[asset] * return_adj
+        weights[asset] = np.clip(adj_weight, min_w[asset], max_w[asset])
+    
+    # Normalize
+    total = sum(weights.values())
+    weights = {k: v / total for k, v in weights.items()}
+    
+    return weights
+
 
 
 @st.cache_data(ttl=3600)
@@ -451,840 +822,9 @@ def get_transformation_label(tcode: int) -> str:
     return labels.get(int(tcode), "Unknown")
 
 
-
-
-@st.cache_data(ttl=3600)
-def get_long_history_assets(start_date: str = '1960-01-01') -> pd.DataFrame:
-    """
-    Constructs a long history (since 1960) by blending FRED data with recent ETFs.
-    """
-    # --- 1. EQUITIES (EQUITY) ---
-    # Draw from FRED-MD directly for long history as it includes S&P 500 since 1959.
-    # This avoids truncations sometimes found in free APIs.
-    equity_ret = pd.Series(dtype=float)
-    try:
-        # Load macro data to extract S&P 500
-        df_macro_raw = pd.read_csv('2025-11-MD.csv').iloc[1:]
-        df_macro_raw['sasdate'] = pd.to_datetime(df_macro_raw['sasdate'], utc=True).dt.tz_localize(None)
-        df_macro_raw.set_index('sasdate', inplace=True)
-        
-        if 'S&P 500' in df_macro_raw.columns:
-            equity_data = pd.to_numeric(df_macro_raw['S&P 500'], errors='coerce').dropna()
-            equity_ret = np.log(equity_data).diff().dropna()
-        else:
-            # Fallback to yahooquery if column missing
-            equity_ticker = '^GSPC'
-            h = Ticker(equity_ticker).history(period='max', interval='1mo')
-            if not h.empty:
-                equity_data = h['adjclose']
-                if isinstance(equity_data.index, pd.MultiIndex):
-                    equity_data.index = equity_data.index.get_level_values('date')
-                equity_data.index = pd.to_datetime(equity_data.index, utc=True).tz_localize(None)
-                equity_ret = np.log(equity_data).diff().dropna()
-    except Exception as e:
-        st.error(f"Error fetching Equity data: {e}")
-
-    # --- 2. GOLD (GOLD) ---
-    # Construction: Splicing Precious Metals PPI (1960) + Import Index (1993) + GLD (2004)
-    gold_final_ret = pd.Series(dtype=float)
-    
-    try:
-        # A. PPI Precious Metals (WPU1022) - Starts 1960
-        gold_ppi = web.DataReader('WPU1022', 'fred', start_date)
-        gold_ppi.index = pd.to_datetime(gold_ppi.index, utc=True).tz_localize(None)
-        gold_ppi = gold_ppi.resample('MS').last()
-        gold_ppi_ret = np.log(gold_ppi).diff().dropna()['WPU1022']
-        gold_final_ret = gold_ppi_ret.copy()
-        
-        # B. Gold Import Price Index (IR14270) - Starts 1992
-        try:
-            gold_import = web.DataReader('IR14270', 'fred', '1990-01-01')
-            gold_import.index = pd.to_datetime(gold_import.index, utc=True).tz_localize(None)
-            gold_import = gold_import.resample('MS').last()
-            gold_import_ret = np.log(gold_import).diff().dropna()['IR14270']
-            
-            # Splice IR14270 over PPI where available (usually more accurate for gold specifically)
-            if not gold_import_ret.empty:
-                common_idx = gold_final_ret.index.intersection(gold_import_ret.index)
-                gold_final_ret.loc[common_idx] = gold_import_ret.loc[common_idx]
-                new_idx = gold_import_ret.index.difference(gold_final_ret.index)
-                gold_final_ret = pd.concat([gold_final_ret, gold_import_ret.loc[new_idx]]).sort_index()
-        except:
-            pass # Fall back to PPI if Import Index fails
-
-        # C. GLD ETF - Recent period
-        gld_ticker = 'GLD'
-        gld_data = Ticker(gld_ticker).history(period='max', interval='1mo')['adjclose']
-        if isinstance(gld_data.index, pd.MultiIndex):
-            gld_data.index = gld_data.index.get_level_values('date')
-        gld_data.index = pd.to_datetime(gld_data.index, utc=True).tz_localize(None)
-        gld_ret = np.log(gld_data).diff().dropna()
-        
-        if not gld_ret.empty:
-            common_idx = gold_final_ret.index.intersection(gld_ret.index)
-            gold_final_ret.loc[common_idx] = gld_ret.loc[common_idx]
-            new_idx = gld_ret.index.difference(gold_final_ret.index)
-            gold_final_ret = pd.concat([gold_final_ret, gld_ret.loc[new_idx]]).sort_index()
-            
-    except Exception as e:
-        st.error(f"Critical error constructing Gold history: {e}")
-        # Final fallback: return empty if everything fails
-
-    # --- 3. BONDS (BONDS) - "Total Return" Method ---
-    # Before: TLT (2002). Now: Synthetic 10Y Yield (GS10) + IEF.
-    
-    # A. Fetch Recent ETF (IEF = Treasury 7-10 Year)
-    ief_ticker = 'IEF'
-    ief_data = Ticker(ief_ticker).history(period='max', interval='1mo')['adjclose']
-    if isinstance(ief_data.index, pd.MultiIndex):
-        ief_data.index = ief_data.index.get_level_values('date')
-    ief_data.index = pd.to_datetime(ief_data.index, utc=True).tz_localize(None)
-    ief_ret = np.log(ief_data).diff().dropna()
-    
-    # B. Construct Synthetic History via FRED (GS10)
-    bond_combined_ret = pd.Series(dtype=float)
-    try:
-        gs10 = web.DataReader('GS10', 'fred', start_date)
-        gs10.index = pd.to_datetime(gs10.index, utc=True).tz_localize(None)
-        yields = gs10['GS10'] / 100  # Convert to decimal
-        
-        # Approximation formula for Monthly Total Return:
-        # Return = Carry (Coupon/12) + Price Change (-Duration * DeltaYield)
-        duration = 7.5  # Standard average duration for 10Y Treasuries
-        carry = yields.shift(1) / 12
-        price_change = -duration * (yields - yields.shift(1))
-        
-        synth_simple_ret = carry + price_change
-        synth_log_ret = np.log(1 + synth_simple_ret).dropna()
-        bond_combined_ret = synth_log_ret.copy()
-    except Exception as e:
-        st.warning(f"Could not fetch historical Bond data (GS10) from FRED: {e}")
-
-    # C. Splicing
-    if not ief_ret.empty:
-        cutoff_date = ief_ret.index[0]
-        # Keep synthetic before ETF start, and ETF after
-        bond_final_ret = pd.concat([
-            bond_combined_ret[bond_combined_ret.index < cutoff_date],
-            ief_ret
-        ])
-    else:
-        bond_final_ret = bond_combined_ret
-
-    # --- 4. MERGE AND RECONSTRUCT PRICES ---
-    # Create a single aligned DataFrame
-    all_ret = pd.DataFrame({
-        'EQUITY': equity_ret,
-        'GOLD': gold_final_ret,
-        'BONDS': bond_final_ret
-    }).dropna()
-    
-    # Reconstruct Base 100 Price Indices for display/VECM
-    # Price_t = 100 * exp(cumulative sum of log returns)
-    df_prices = 100 * np.exp(all_ret.cumsum())
-    df_prices.index.name = 'date'
-    
-    return df_prices
-
-
-# ============================================================================
-# VECM MODEL COMPONENTS
-# ============================================================================
-
-class KernelDictionary:
-    """Temporal Kernel Dictionary for multi-scale cycle capture."""
-    
-    def __init__(self):
-        self.dense_lags = list(range(1, 7))  # Lags 1-6 for immediate reactivity
-        self.anchor_lags = [12, 24, 36, 48, 60]  # Gaussian-weighted anchors
-        
-    def compute_gaussian_weights(self, lag: int, sigma: float = 3.0) -> np.ndarray:
-        """Compute Gaussian weights for anchor lags."""
-        x = np.arange(-lag//2, lag//2 + 1)
-        weights = np.exp(-x**2 / (2 * sigma**2))
-        return weights / weights.sum()
-    
-    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply kernel dictionary transformation."""
-        features = {}
-        
-        # Dense lags (direct values)
-        for lag in self.dense_lags:
-            for col in data.columns:
-                features[f'{col}_L{lag}'] = data[col].shift(lag)
-        
-        # Anchor lags (Gaussian-weighted moving averages)
-        for anchor in self.anchor_lags:
-            weights = self.compute_gaussian_weights(anchor)
-            for col in data.columns:
-                ma = data[col].rolling(window=len(weights), center=True).apply(
-                    lambda x: np.dot(x, weights[:len(x)]) if len(x) == len(weights) else np.nan
-                )
-                features[f'{col}_A{anchor}'] = ma.shift(anchor // 2)
-        
-        return pd.DataFrame(features, index=data.index).dropna()
-
-
-class RegimeSentinel:
-    """Regime Sentinel for structural break detection and crisis early warning."""
-    
-    def __init__(self, lookback: int = 60, alert_threshold: float = 2.5):
-        self.lookback = lookback
-        self.alert_threshold = alert_threshold
-        self.status = "CALM"
-        self.stress_score = 0.0
-        
-    def compute_stress_indicators(self, data: pd.DataFrame) -> dict:
-        """Compute market stress indicators."""
-        recent = data.tail(self.lookback)
-        
-        # Credit stress (spread widening)
-        if 'BAA_AAA' in recent.columns:
-            spread_z = (recent['BAA_AAA'].iloc[-1] - recent['BAA_AAA'].mean()) / recent['BAA_AAA'].std()
-        else:
-            spread_z = 0
-        
-        # Yield curve stress
-        if 'SPREAD' in recent.columns:
-            curve_z = -(recent['SPREAD'].iloc[-1] - recent['SPREAD'].mean()) / recent['SPREAD'].std()
-        else:
-            curve_z = 0
-        
-        # Production stress
-        if 'INDPRO' in recent.columns:
-            prod_change = recent['INDPRO'].pct_change().iloc[-3:].mean() * 12
-            prod_z = -prod_change / 0.03  # Normalize to typical annual growth
-        else:
-            prod_z = 0
-        
-        # Employment stress
-        if 'UNRATE' in recent.columns:
-            unrate_change = recent['UNRATE'].iloc[-1] - recent['UNRATE'].iloc[-6]
-            emp_z = unrate_change / 0.5  # Normalize
-        else:
-            emp_z = 0
-        
-        return {
-            'credit_stress': spread_z,
-            'curve_stress': curve_z,
-            'production_stress': prod_z,
-            'employment_stress': emp_z
-        }
-    
-    def evaluate(self, data: pd.DataFrame) -> tuple:
-        """Evaluate current regime status."""
-        indicators = self.compute_stress_indicators(data)
-        
-        # Composite stress score
-        self.stress_score = (
-            0.35 * indicators['credit_stress'] +
-            0.25 * indicators['curve_stress'] +
-            0.25 * indicators['production_stress'] +
-            0.15 * indicators['employment_stress']
-        )
-        
-        # Determine status
-        if self.stress_score > self.alert_threshold:
-            self.status = "ALERT"
-        elif self.stress_score > self.alert_threshold * 0.6:
-            self.status = "WARNING"
-        else:
-            self.status = "CALM"
-        
-        return self.status, self.stress_score, indicators
-    
-    def compute_history(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Compute historical regime status (vectorized)."""
-        df = data.copy()
-        
-        # 1. Credit Stress (Widening Spreads)
-        # Using 24m rolling Z-score to capture cycle turns
-        if 'BAA_AAA' in df.columns:
-            roll_mean = df['BAA_AAA'].rolling(48).mean()
-            roll_std = df['BAA_AAA'].rolling(48).std()
-            df['credit_stress'] = (df['BAA_AAA'] - roll_mean) / roll_std
-        
-        # 2. Curve Stress (Inversion)
-        if 'SPREAD' in df.columns:
-            roll_mean = df['SPREAD'].rolling(48).mean()
-            roll_std = df['SPREAD'].rolling(48).std()
-            # Inversion (negative) -> High Stress
-            df['curve_stress'] = -(df['SPREAD'] - roll_mean) / roll_std
-
-        # 3. Production Stress (YoY Contraction)
-        if 'INDPRO' in df.columns:
-            yoy = df['INDPRO'].pct_change(12)
-            # Negative growth -> High Stress. Normalize by 2% std dev proxy
-            df['prod_stress'] = -yoy / 0.02
-
-        # 4. Employment Stress (Sahm Rule-ish)
-        if 'UNRATE' in df.columns:
-            # Change from 12m low
-            low_12m = df['UNRATE'].rolling(12).min()
-            df['emp_stress'] = (df['UNRATE'] - low_12m) / 0.5 # 0.5% rise is trigger
-            
-        # Composite Score
-        features = ['credit_stress', 'curve_stress', 'prod_stress', 'emp_stress']
-        available = [f for f in features if f in df.columns]
-        
-        if not available:
-            return pd.DataFrame()
-            
-        df = df[available].fillna(0)
-        
-        # Weighted sum (matching single-point logic)
-        weights = {'credit_stress': 0.35, 'curve_stress': 0.25, 'prod_stress': 0.25, 'emp_stress': 0.15}
-        df['score'] = sum(df[col] * weights[col] for col in available)
-        
-        # Smooth score
-        df['score_smooth'] = df['score'].rolling(3).mean()
-        
-        # Assign Regimes
-        # > 1.5 -> Contraction (Crisis)
-        # 0.5 to 1.5 -> Peak (Slowdown)
-        # < -0.5 -> Recovery (Trough)
-        # -0.5 to 0.5 -> Expansion (Goldilocks)
-        
-        def get_regime(score):
-            if score > 1.5: return 'Contraction'
-            if score > 0.5: return 'Peak'
-            if score < -0.5: return 'Trough'
-            return 'Expansion'
-            
-        df['regime'] = df['score_smooth'].apply(get_regime)
-        
-        return df[['score', 'regime']]
-
-
-class AdaptiveElasticNetVECM:
-    """Adaptive Sparse VECM with Elastic Net regularization."""
-    
-    def __init__(self, l1_ratio: float = 0.3, alpha: float = 0.005, decay: float = 0.98):
-        self.l1_ratio = l1_ratio  # Ridge-heavy for stability
-        self.alpha = alpha
-        self.decay = decay  # Exponential time weighting
-        self.cointegration_rank = None
-        self.cointegration_vars = None
-        self.beta = None
-        self.gamma = None
-        self.intercepts = None
-        self.ect = None
-        
-    def compute_time_weights(self, n: int) -> np.ndarray:
-        """Compute exponential decay weights."""
-        decay_vals = np.array([self.decay ** i for i in range(n-1, -1, -1)])
-        sum_decay = decay_vals.sum()
-        if sum_decay == 0:
-            return np.ones(n) / n
-        return decay_vals / sum_decay
-    
-    def estimate_cointegration(self, levels, n_lags=4):
-        # Real Johansen Test
-        # Drop 'SPREAD' if GS10 and FEDFUNDS are present to avoid exact singularity
-        df_coint = levels.copy()
-        if 'SPREAD' in df_coint.columns and 'GS10' in df_coint.columns and 'FEDFUNDS' in df_coint.columns:
-            df_coint = df_coint.drop(columns=['SPREAD'])
-            
-        # Limit to max 12 variables (statsmodels limitation & numerical stability)
-        if len(df_coint.columns) > 12:
-            core_vars = ['INDPRO', 'CPI', 'FEDFUNDS', 'GS10', 'UNRATE', 'PAYEMS', 'HOUST', 'M2', 'PPI', 'PCE', 'CAPACITY', 'IPFINAL']
-            self.cointegration_vars = [c for c in core_vars if c in df_coint.columns][:12]
-        else:
-            self.cointegration_vars = list(df_coint.columns)
-            
-        df_coint = df_coint[self.cointegration_vars]
-        
-        try:
-            jores = coint_johansen(df_coint.values, det_order=0, k_ar_diff=n_lags)
-            
-            # Store real results
-            self.cointegration_rank = 1 
-            self.beta = jores.evec[:, :self.cointegration_rank]
-            
-            return {
-                'rank': self.cointegration_rank,
-                'eigenvalues': jores.eig,
-                'trace_stats': jores.lr1,
-                'critical_values': jores.cvt[:, 1] # 5% critical values
-            }
-        except Exception as e:
-            # Failsafe if real calculation fails (numerical stability)
-            self.cointegration_rank = 1
-            self.beta = np.zeros((len(self.cointegration_vars), 1))
-            self.beta[0, 0] = 1.0 # Simple unit vector as fallback
-            
-            return {
-                'rank': self.cointegration_rank,
-                'error': str(e),
-                'status': 'fallback applied'
-            }
-    
-    def compute_ect(self, levels: pd.DataFrame) -> pd.Series:
-        """Compute Error Correction Term."""
-        if self.beta is None or self.cointegration_vars is None:
-            return pd.Series(0, index=levels.index)
-        
-        # Use first cointegration vector and align columns
-        selected_cols = [c for c in self.cointegration_vars if c in levels.columns]
-        if not selected_cols:
-             return pd.Series(0, index=levels.index)
-             
-        try:
-            # Align beta with available columns (though they should match)
-            vals = np.nan_to_num(levels[selected_cols].values, nan=0.0).astype(np.float64)
-            beta_v = np.nan_to_num(self.beta[:len(selected_cols), 0], nan=0.0).astype(np.float64)
-            
-            with np.errstate(all='ignore'):
-                ect = np.dot(vals, beta_v)
-                ect = np.nan_to_num(ect, nan=0.0)
-            
-            self.ect = pd.Series(ect, index=levels.index, name='ECT')
-        except Exception:
-            self.ect = pd.Series(0, index=levels.index, name='ECT')
-            
-        return self.ect
-    
-    def estimate_gamma(self, changes, kernel_features):
-        # Scale features for numerical stability and faster convergence
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(kernel_features)
-        X_scaled_df = pd.DataFrame(X_scaled, index=kernel_features.index, columns=kernel_features.columns)
-
-        # Real Elastic Net with increased max_iter for convergence
-        model = ElasticNet(
-            l1_ratio=self.l1_ratio, 
-            alpha=self.alpha, 
-            fit_intercept=True,
-            max_iter=5000,
-            tol=1e-3
-        )
-        
-        # Align indices between changes (target) and features (X)
-        common_idx = changes.index.intersection(X_scaled_df.index)
-        
-        model.fit(X_scaled_df.loc[common_idx], changes.loc[common_idx])
-        
-        coef_ = model.coef_
-        if coef_.ndim == 1:
-            coef_ = coef_.reshape(1, -1)
-            
-        # Re-scale coefficients back to original scale for interpretability if needed
-        # But for the asset equations display, we'll keep them as they are or note they are on scaled data
-        self.gamma = pd.DataFrame(
-            coef_, 
-            index=changes.columns,
-            columns=kernel_features.columns
-        )
-        self.intercepts = pd.Series(model.intercept_, index=changes.columns)
-        
-        # Compute fitted values
-        fitted = pd.DataFrame(
-            model.predict(X_scaled_df.loc[common_idx]),
-            index=common_idx,
-            columns=changes.columns
-        )
-        
-        return self.gamma, fitted
-
-
-class PortfolioAllocator:
-    """Strategic portfolio allocation based on VECM signals."""
-    
-    def __init__(self, rebalance_freq: str = 'quarterly'):
-        self.rebalance_freq = rebalance_freq
-        self.target_weights = {'EQUITY': 0.60, 'BONDS': 0.30, 'GOLD': 0.10}
-        self.min_weights = {'EQUITY': 0.20, 'BONDS': 0.20, 'GOLD': 0.05}
-        self.max_weights = {'EQUITY': 0.80, 'BONDS': 0.60, 'GOLD': 0.30}
-        
-    def generate_signals(self, ect: pd.Series, sentinel_status: str, stress_score: float) -> dict:
-        """Generate allocation signals from ECT and regime."""
-        # ECT signal (-1 to +1)
-        ect_zscore = (ect.iloc[-1] - ect.mean()) / ect.std() if ect.std() > 0 else 0
-        ect_signal = np.clip(-ect_zscore / 2, -1, 1)
-        
-        # Regime adjustment
-        if sentinel_status == "ALERT":
-            risk_multiplier = 0.3
-        elif sentinel_status == "WARNING":
-            risk_multiplier = 0.6
-        else:
-            risk_multiplier = 1.0
-        
-        # Compute target weights
-        base_equity = 0.60
-        base_bonds = 0.30
-        base_gold = 0.10
-        
-        # Adjust based on signals
-        equity_adj = base_equity + ect_signal * 0.15 * risk_multiplier
-        gold_adj = base_gold + (1 - risk_multiplier) * 0.15
-        bonds_adj = 1 - equity_adj - gold_adj
-        
-        # Apply constraints
-        weights = {
-            'EQUITY': np.clip(equity_adj, self.min_weights['EQUITY'], self.max_weights['EQUITY']),
-            'BONDS': np.clip(bonds_adj, self.min_weights['BONDS'], self.max_weights['BONDS']),
-            'GOLD': np.clip(gold_adj, self.min_weights['GOLD'], self.max_weights['GOLD'])
-        }
-        
-        # Normalize
-        total = sum(weights.values())
-        weights = {k: v/total for k, v in weights.items()}
-        
-        self.target_weights = weights
-        
-        return {
-            'weights': weights,
-            'ect_signal': ect_signal,
-            'risk_multiplier': risk_multiplier,
-            'rebalance_trigger': sentinel_status == "ALERT"
-        }
-
-
-# ============================================================================
-# VISUALIZATION FUNCTIONS
-# ============================================================================
-
-def create_plotly_theme():
-    """Create consistent Plotly theme."""
-    return {
-        'paper_bgcolor': '#0a0a0a',
-        'plot_bgcolor': '#111111',
-        'font': {'family': 'IBM Plex Mono', 'color': '#888888', 'size': 11},
-        'title': {'font': {'size': 13, 'color': '#e8e8e8'}},
-        'xaxis': {
-            'gridcolor': '#1a1a1a',
-            'linecolor': '#2a2a2a',
-            'tickfont': {'size': 10}
-        },
-        'yaxis': {
-            'gridcolor': '#1a1a1a',
-            'linecolor': '#2a2a2a',
-            'tickfont': {'size': 10}
-        }
-    }
-
-
-def plot_allocation_chart(weights: dict) -> go.Figure:
-    """Create allocation donut chart."""
-    colors = {'EQUITY': '#ff6b35', 'BONDS': '#4da6ff', 'GOLD': '#ffd700'}
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=list(weights.keys()),
-        values=list(weights.values()),
-        hole=0.65,
-        marker=dict(colors=[colors[k] for k in weights.keys()], line=dict(color='#0a0a0a', width=2)),
-        textinfo='label+percent',
-        textfont=dict(family='IBM Plex Mono', size=11, color='#e8e8e8'),
-        hovertemplate='%{label}: %{value:.1%}<extra></extra>'
-    )])
-    
-    theme = create_plotly_theme()
-    fig.update_layout(
-        showlegend=False,
-        paper_bgcolor=theme['paper_bgcolor'],
-        plot_bgcolor=theme['plot_bgcolor'],
-        margin=dict(l=20, r=20, t=20, b=20),
-        height=250,
-        annotations=[dict(
-            text='<b>TARGET</b>',
-            x=0.5, y=0.5,
-            font=dict(family='IBM Plex Mono', size=12, color='#888888'),
-            showarrow=False
-        )]
-    )
-    
-    return fig
-
-
-def plot_stress_gauge(stress_score: float, status: str) -> go.Figure:
-    """Create stress gauge chart."""
-    color = {'CALM': '#00d26a', 'WARNING': '#ff6b35', 'ALERT': '#ff4757'}[status]
-    
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=stress_score,
-        domain={'x': [0, 1], 'y': [0, 1]},
-        number={'font': {'family': 'IBM Plex Mono', 'size': 28, 'color': color}},
-        gauge={
-            'axis': {'range': [0, 5], 'tickfont': {'size': 10, 'color': '#555555'}},
-            'bar': {'color': color, 'thickness': 0.7},
-            'bgcolor': '#1a1a1a',
-            'borderwidth': 1,
-            'bordercolor': '#2a2a2a',
-            'steps': [
-                {'range': [0, 1.5], 'color': 'rgba(0, 210, 106, 0.1)'},
-                {'range': [1.5, 2.5], 'color': 'rgba(255, 107, 53, 0.1)'},
-                {'range': [2.5, 5], 'color': 'rgba(255, 71, 87, 0.1)'}
-            ],
-            'threshold': {
-                'line': {'color': '#ffffff', 'width': 2},
-                'thickness': 0.8,
-                'value': stress_score
-            }
-        }
-    ))
-    
-    theme = create_plotly_theme()
-    fig.update_layout(
-        paper_bgcolor=theme['paper_bgcolor'],
-        plot_bgcolor=theme['plot_bgcolor'],
-        margin=dict(l=20, r=20, t=30, b=20),
-        height=200
-    )
-    
-    return fig
-
-
-def plot_ect_series(ect: pd.Series) -> go.Figure:
-    """Plot Error Correction Term time series."""
-    theme = create_plotly_theme()
-    
-    fig = go.Figure()
-    
-    # Add zero line
-    fig.add_hline(y=0, line_dash="dash", line_color="#2a2a2a", line_width=1)
-    
-    # Add ±1 std bands
-    std = ect.std()
-    fig.add_hrect(y0=-std, y1=std, fillcolor="rgba(77, 166, 255, 0.05)", line_width=0)
-    
-    # ECT line
-    fig.add_trace(go.Scatter(
-        x=ect.index,
-        y=ect.values,
-        mode='lines',
-        line=dict(color='#4da6ff', width=1.5),
-        fill='tozeroy',
-        fillcolor='rgba(77, 166, 255, 0.1)',
-        hovertemplate='%{x|%b %Y}<br>ECT: %{y:.3f}<extra></extra>'
-    ))
-    
-    # Current value marker
-    fig.add_trace(go.Scatter(
-        x=[ect.index[-1]],
-        y=[ect.iloc[-1]],
-        mode='markers',
-        marker=dict(color='#ff6b35', size=8, symbol='circle'),
-        hoverinfo='skip'
-    ))
-    
-    fig.update_layout(
-        showlegend=False,
-        paper_bgcolor=theme['paper_bgcolor'],
-        plot_bgcolor=theme['plot_bgcolor'],
-        margin=dict(l=50, r=20, t=10, b=40),
-        height=200,
-        xaxis=dict(**theme['xaxis'], showgrid=False),
-        yaxis=dict(**theme['yaxis'], title='ECT', title_font=dict(size=10))
-    )
-    
-    return fig
-
-
-def plot_macro_heatmap(data: pd.DataFrame, n_periods: int = 24) -> go.Figure:
-    """Create macro indicators heatmap."""
-    recent = data.tail(n_periods)
-    
-    # Calculate z-scores
-    zscores = (recent - recent.mean()) / recent.std()
-    
-    # Select key indicators
-    indicators = ['PAYEMS', 'INDPRO', 'CPI', 'UNRATE', 'SPREAD', 'BAA_AAA']
-    available = [i for i in indicators if i in zscores.columns]
-    
-    if not available:
-        available = list(zscores.columns)[:6]
-    
-    z_matrix = zscores[available].T.values
-    
-    fig = go.Figure(data=go.Heatmap(
-        z=z_matrix,
-        x=recent.index.strftime('%b %y'),
-        y=available,
-        colorscale=[
-            [0, '#ff4757'],
-            [0.25, '#ff6b35'],
-            [0.5, '#1a1a1a'],
-            [0.75, '#4da6ff'],
-            [1, '#00d26a']
-        ],
-        zmid=0,
-        zmin=-2,
-        zmax=2,
-        colorbar=dict(
-            title=dict(text='Z-Score', font=dict(size=10, color='#888888')),
-            tickfont=dict(size=9, color='#888888'),
-            thickness=10,
-            len=0.8
-        ),
-        hovertemplate='%{y}<br>%{x}: %{z:.2f}<extra></extra>'
-    ))
-    
-    theme = create_plotly_theme()
-    fig.update_layout(
-        paper_bgcolor=theme['paper_bgcolor'],
-        plot_bgcolor=theme['plot_bgcolor'],
-        margin=dict(l=80, r=20, t=10, b=40),
-        height=220,
-        xaxis=dict(tickangle=-45, tickfont=dict(size=9, color='#888888')),
-        yaxis=dict(tickfont=dict(size=10, color='#888888'))
-    )
-    
-    return fig
-
-
-def plot_coef_heatmap(gamma: pd.DataFrame) -> go.Figure:
-    """Create coefficient heatmap for VECM dynamics."""
-    # Sample subset for visualization
-    n_rows = min(10, len(gamma.index))
-    n_cols = min(20, len(gamma.columns))
-    
-    subset = gamma.iloc[:n_rows, :n_cols]
-    
-    fig = go.Figure(data=go.Heatmap(
-        z=subset.values,
-        x=[c[:12] for c in subset.columns],
-        y=subset.index,
-        colorscale=[
-            [0, '#ff4757'],
-            [0.5, '#111111'],
-            [1, '#00d26a']
-        ],
-        zmid=0,
-        colorbar=dict(
-            title=dict(text='Γ', font=dict(size=11, color='#888888')),
-            tickfont=dict(size=9, color='#888888'),
-            thickness=10
-        ),
-        hovertemplate='%{y} ← %{x}<br>Γ: %{z:.4f}<extra></extra>'
-    ))
-    
-    theme = create_plotly_theme()
-    fig.update_layout(
-        paper_bgcolor=theme['paper_bgcolor'],
-        plot_bgcolor=theme['plot_bgcolor'],
-        margin=dict(l=60, r=20, t=10, b=60),
-        height=300,
-        xaxis=dict(tickangle=-45, tickfont=dict(size=8, color='#888888')),
-        yaxis=dict(tickfont=dict(size=10, color='#888888'))
-    )
-    
-    return fig
-
-
-def plot_actual_vs_fitted(actual_returns: pd.Series, fitted_returns: pd.Series, title: str) -> go.Figure:
-    """Plot cumulative actual vs fitted returns."""
-    theme = create_plotly_theme()
-    
-    # Convert log-returns to price level (cumulative sum of log returns)
-    # Alignment check
-    common_idx = actual_returns.index.intersection(fitted_returns.index)
-    actual = actual_returns.loc[common_idx]
-    fitted = fitted_returns.loc[common_idx]
-    
-    actual_prices = np.exp(actual.cumsum()) * 100
-    fitted_prices = np.exp(fitted.cumsum()) * 100
-    
-    fig = go.Figure()
-    
-    # Add Recession Bands
-    for start, end in NBER_RECESSIONS:
-        if pd.to_datetime(start) <= common_idx[-1] and pd.to_datetime(end) >= common_idx[0]:
-            fig.add_vrect(
-                x0=start, x1=end,
-                fillcolor="#ffffff", opacity=0.05,
-                layer="below", line_width=0
-            )
-    
-    fig.add_trace(go.Scatter(
-        x=common_idx,
-        y=actual_prices,
-        name='Actual',
-        mode='lines',
-        line=dict(color='#ff6b35', width=1.5),
-        hovertemplate='Actual: %{y:.2f}<extra></extra>'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=common_idx,
-        y=fitted_prices,
-        name='Model Fitted',
-        mode='lines',
-        line=dict(color='#00d26a', width=1.5, dash='dot'),
-        hovertemplate='Fitted: %{y:.2f}<extra></extra>'
-    ))
-    
-    fig.update_layout(
-        title=dict(
-            text=f"<b>{title} Analysis</b>: Actual vs Equation",
-            font=dict(family='IBM Plex Mono', size=12, color='#e8e8e8'),
-            x=0.02, y=0.95
-        ),
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=1.02,
-            xanchor='right',
-            x=1,
-            font=dict(size=10, color='#888888')
-        ),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=40, r=20, t=60, b=40),
-        height=250,
-        xaxis=dict(**theme['xaxis'], showgrid=False),
-        yaxis=dict(**theme['yaxis'], title='Indexed (100)', title_font=dict(size=9))
-    )
-    
-    return fig
-
-
-def plot_asset_performance(prices: pd.DataFrame, weights_history: list = None) -> go.Figure:
-    """Plot asset performance with allocation overlay."""
-    theme = create_plotly_theme()
-    
-    # Normalize to 100
-    normalized = prices / prices.iloc[0] * 100
-    
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    colors = {'EQUITY': '#ff6b35', 'BONDS': '#4da6ff', 'GOLD': '#ffd700'}
-    
-    for col in normalized.columns:
-        fig.add_trace(go.Scatter(
-            x=normalized.index,
-            y=normalized[col],
-            name=col,
-            mode='lines',
-            line=dict(color=colors.get(col, '#888888'), width=1.5),
-            hovertemplate=f'{col}<br>%{{x|%b %Y}}: %{{y:.1f}}<extra></extra>'
-        ), secondary_y=False)
-    
-    fig.update_layout(
-        showlegend=True,
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=1.02,
-            xanchor='left',
-            x=0,
-            font=dict(size=10, color='#888888')
-        ),
-        paper_bgcolor=theme['paper_bgcolor'],
-        plot_bgcolor=theme['plot_bgcolor'],
-        margin=dict(l=50, r=20, t=30, b=40),
-        height=280,
-        xaxis=dict(**theme['xaxis'], showgrid=False),
-        yaxis=dict(**theme['yaxis'], title='Indexed (100)', title_font=dict(size=10))
-    )
-    
-    return fig
-
-
 def plot_fred_series(data: pd.Series, title: str, subtitle: str, is_transformed: bool = False) -> go.Figure:
     """Create a detailed plot for a FRED-MD series with stats and recession bands."""
-    theme = create_plotly_theme()
+    theme = create_theme()
     color = '#ff4757' if is_transformed else '#4da6ff'
     
     # Calculate statistics
@@ -1333,693 +873,1513 @@ def plot_fred_series(data: pd.Series, title: str, subtitle: str, is_transformed:
     return fig
 
 
-def plot_regime_timeline(macro_data: pd.DataFrame, regime_history: pd.DataFrame = None) -> go.Figure:
-    """Create regime detection timeline."""
-    theme = create_plotly_theme()
-    
-    if regime_history is None or regime_history.empty:
-        # Fallback if no history computed
-        regimes = ['Expansion'] * len(macro_data)
-        dates = macro_data.index
-    else:
-        # Align dates
-        common = macro_data.index.intersection(regime_history.index)
-        regimes = regime_history.loc[common, 'regime'].tolist()
-        dates = common
-    
-    regime_colors = {
-        'Expansion': '#00d26a',
-        'Peak': '#ffd700',
-        'Contraction': '#ff4757',
-        'Trough': '#4da6ff'
+def create_theme():
+    return {
+        'paper_bgcolor': '#0a0a0a',
+        'plot_bgcolor': '#111111',
+        'font': {'family': 'IBM Plex Mono', 'color': '#888888', 'size': 11},
+        'xaxis': {'gridcolor': '#1a1a1a', 'linecolor': '#2a2a2a'},
+        'yaxis': {'gridcolor': '#1a1a1a', 'linecolor': '#2a2a2a'}
     }
+
+
+def plot_allocation(weights: dict) -> go.Figure:
+    colors = {'EQUITY': '#ff6b35', 'BONDS': '#4da6ff', 'GOLD': '#ffd700'}
     
-    # Create numeric mapping
-    regime_map = {'Expansion': 3, 'Peak': 2, 'Contraction': 1, 'Trough': 0}
-    regime_values = [regime_map[r] for r in regimes]
+    fig = go.Figure(data=[go.Pie(
+        labels=list(weights.keys()),
+        values=list(weights.values()),
+        hole=0.65,
+        marker=dict(colors=[colors[k] for k in weights.keys()], line=dict(color='#0a0a0a', width=2)),
+        textinfo='label+percent',
+        textfont=dict(family='IBM Plex Mono', size=11, color='#e8e8e8')
+    )])
+    
+    theme = create_theme()
+    fig.update_layout(
+        showlegend=False,
+        paper_bgcolor=theme['paper_bgcolor'],
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=250,
+        annotations=[dict(text='<b>TARGET</b>', x=0.5, y=0.5,
+                         font=dict(family='IBM Plex Mono', size=12, color='#888'), showarrow=False)]
+    )
+    return fig
+
+
+def plot_assets(prices: pd.DataFrame) -> go.Figure:
+    theme = create_theme()
+    normalized = prices / prices.iloc[0] * 100
     
     fig = go.Figure()
+    colors = {'EQUITY': '#ff6b35', 'BONDS': '#4da6ff', 'GOLD': '#ffd700'}
     
-    # Background regions (optimized loop to create blocks)
-    # Finding state changes to draw rectangles instead of 1000 lines
+    for col in normalized.columns:
+        fig.add_trace(go.Scatter(
+            x=normalized.index, y=normalized[col], name=col,
+            mode='lines', line=dict(color=colors.get(col, '#888'), width=1.5)
+        ))
     
-    if len(dates) > 0:
-        current_state = regimes[0]
-        start_date = dates[0]
-        
-        for i in range(1, len(dates)):
-            if regimes[i] != current_state:
-                # End of block
-                fig.add_vrect(
-                    x0=start_date,
-                    x1=dates[i],
-                    fillcolor=regime_colors.get(current_state, '#111'),
-                    opacity=0.15,
-                    line_width=0
-                )
-                current_state = regimes[i]
-                start_date = dates[i]
-        
-        # Last block
-        fig.add_vrect(
-            x0=start_date,
-            x1=dates[-1],
-            fillcolor=regime_colors.get(current_state, '#111'),
-            opacity=0.15,
-            line_width=0
-        )
+    fig.update_layout(
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=50, r=20, t=30, b=40),
+        height=280,
+        xaxis=dict(gridcolor='#1a1a1a'),
+        yaxis=dict(gridcolor='#1a1a1a', title='Indexed (100)')
+    )
+    return fig
+
+
+def plot_ect(ect: pd.Series) -> go.Figure:
+    theme = create_theme()
     
-    # Add regime line
+    fig = go.Figure()
+    fig.add_hline(y=0, line_dash="dash", line_color="#2a2a2a")
+    
+    std = ect.std()
+    fig.add_hrect(y0=-std, y1=std, fillcolor="rgba(77, 166, 255, 0.05)", line_width=0)
+    
     fig.add_trace(go.Scatter(
-        x=dates,
-        y=regime_values,
-        mode='lines',
-        line=dict(color='#ffffff', width=1, shape='hv'), # step chart
-        hovertemplate='%{x|%b %Y}<br>Regime: ' + '%{text}<extra></extra>',
-        text=regimes
+        x=ect.index, y=ect.values, mode='lines',
+        line=dict(color='#4da6ff', width=1.5),
+        fill='tozeroy', fillcolor='rgba(77, 166, 255, 0.1)'
     ))
     
-    # Merge yaxis settings safely
-    yaxis_settings = theme['yaxis'].copy()
-    yaxis_settings.update(
-        tickmode='array',
-        tickvals=[0, 1, 2, 3],
-        ticktext=['Trough', 'Contract.', 'Peak', 'Expans.'],
-        tickfont=dict(size=9)
-    )
-
     fig.update_layout(
         showlegend=False,
         paper_bgcolor=theme['paper_bgcolor'],
         plot_bgcolor=theme['plot_bgcolor'],
         margin=dict(l=50, r=20, t=10, b=40),
         height=150,
-        xaxis=dict(**theme['xaxis'], showgrid=False),
-        yaxis=yaxis_settings
+        xaxis=dict(gridcolor='#1a1a1a'),
+        yaxis=dict(gridcolor='#1a1a1a', title='ECT')
+    )
+    return fig
+
+
+def plot_feature_heatmap(selection_history: pd.DataFrame, descriptions: dict) -> go.Figure:
+    """
+    Visualize stability selection probabilities over time.
+    """
+    if selection_history.empty:
+        return go.Figure()
+        
+    theme = create_theme()
+    
+    # Transpose so variables are on Y-axis and time on X-axis
+    df_plot = selection_history.T
+    
+    # Sort Y-axis by average probability to put most stable on top
+    avg_probs = df_plot.mean(axis=1).sort_values(ascending=True)
+    df_plot = df_plot.loc[avg_probs.index]
+    
+    # Create labels with descriptions
+    y_labels = [f"{col} ({descriptions.get(col.split('_')[0], 'Macro Variable')})" for col in df_plot.index]
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=df_plot.values,
+        x=df_plot.columns,
+        y=y_labels,
+        colorscale=[[0, '#0a0a0a'], [0.5, 'rgba(77, 166, 255, 0.2)'], [1, '#4da6ff']],
+        showscale=True,
+        colorbar=dict(title=dict(text='Selection Prob', side='right'), thickness=15, len=0.7)
+    ))
+    
+    fig.update_layout(
+        title=dict(text='STABILITY SELECTION: FEATURE PERSISTENCE OVER TIME', font=dict(size=12, color='#888')),
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        xaxis=dict(title='Estimation Date', gridcolor='#1a1a1a'),
+        yaxis=dict(gridcolor='#1a1a1a', tickfont=dict(size=9)),
+        margin=dict(l=10, r=10, t=40, b=40),
+        height=500
     )
     
     return fig
 
 
+def plot_stability_boxplot(results: dict, asset: str, descriptions: dict = None) -> go.Figure:
+    """Show coefficient distribution across windows."""
+    theme = create_theme()
+    
+    if asset not in results or 'all_coefficients' not in results[asset]:
+        return go.Figure()
+    
+    coef_df = results[asset]['all_coefficients']
+    stable_feats = results[asset].get('stable_features', [])[:8]
+    
+    if not stable_feats:
+        return go.Figure()
+    
+    fig = go.Figure()
+    colors = ['#ff6b35', '#4da6ff', '#ffd700', '#00d26a', '#ff4757', '#9b59b6', '#1abc9c', '#e74c3c']
+    
+    for i, feat in enumerate(stable_feats):
+        if feat in coef_df.columns:
+            base_var = feat.split('_')[0]
+            desc = descriptions.get(base_var, base_var) if descriptions else base_var
+            
+            fig.add_trace(go.Box(
+                y=coef_df[feat], 
+                name=feat[:12],
+                marker_color=colors[i % len(colors)],
+                boxmean=True,
+                hovertext=desc,
+                hoverinfo='y+text+name'
+            ))
+    
+    fig.update_layout(
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=40, r=20, t=20, b=60),
+        height=250,
+        showlegend=False,
+        xaxis=dict(tickangle=-45, tickfont=dict(size=9)),
+        yaxis=dict(gridcolor='#1a1a1a', title='Coefficient')
+    )
+    return fig
+
+
+def plot_trend_bars(trend_df: pd.DataFrame, variables: list, descriptions: dict = None) -> go.Figure:
+    """Plot 5Y trend comparison."""
+    theme = create_theme()
+    
+    filtered = trend_df[trend_df['Variable'].isin(variables)]
+    if filtered.empty:
+        return go.Figure()
+    
+    colors = ['#00d26a' if x > 0.05 else '#ff4757' if x < -0.05 else '#888888' 
+              for x in filtered['Slope_5Y']]
+    
+    hovers = []
+    for var in filtered['Variable']:
+        desc = descriptions.get(var, var) if descriptions else var
+        hovers.append(desc)
+        
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=filtered['Variable'],
+        y=filtered['Slope_5Y'],
+        marker_color=colors,
+        text=[f"{x:.2f}" for x in filtered['Slope_5Y']],
+        textposition='outside',
+        hovertext=hovers,
+        hoverinfo='y+text+x'
+    ))
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="#2a2a2a")
+    
+    fig.update_layout(
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=40, r=20, t=20, b=60),
+        height=250,
+        xaxis=dict(tickangle=-45),
+        yaxis=dict(gridcolor='#1a1a1a', title='5Y Slope (Annualized)')
+    )
+    return fig
+
+
+def plot_driver_vs_asset(feat_data: pd.DataFrame, asset_returns: pd.DataFrame, 
+                         feat_name: str, asset: str, descriptions: dict = None) -> go.Figure:
+    """Plot dual-axis comparison of macro driver and forward asset return using raw values."""
+    theme = create_theme()
+    
+    if feat_name not in feat_data.columns or asset not in asset_returns.columns:
+        return go.Figure()
+        
+    # Align data
+    combined = pd.concat([feat_data[feat_name], asset_returns[asset]], axis=1).dropna()
+    if combined.empty:
+        return go.Figure()
+        
+    macro_vals = combined[feat_name]
+    asset_vals = combined[asset]
+    
+    base_var = feat_name.split('_')[0]
+    desc = descriptions.get(base_var, base_var) if descriptions else base_var
+    title_text = f"{feat_name} ({desc}) vs {asset} Forward Return"
+    
+    fig = go.Figure()
+    
+    # Macro series (left axis)
+    fig.add_trace(go.Scatter(
+        x=combined.index, y=macro_vals, name=feat_name,
+        mode='lines', line=dict(color='#00d26a', width=1.5),
+        hovertemplate="<b>" + feat_name + "</b>: %{y:.4f}<extra></extra>"
+    ))
+    
+    # Asset returns (right axis)
+    fig.add_trace(go.Scatter(
+        x=combined.index, y=asset_vals, name=asset,
+        mode='lines', line=dict(color='#4da6ff', width=1.5),
+        yaxis='y2',
+        hovertemplate="<b>" + asset + " Return</b>: %{y:.2%}<extra></extra>"
+    ))
+    
+    fig.update_layout(
+        title=dict(text=title_text, 
+                  font=dict(family='IBM Plex Mono', size=11, color='#888')),
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=50, r=50, t=40, b=40),
+        height=350,
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
+        hovermode='x unified',
+        xaxis=dict(
+            gridcolor='#1a1a1a',
+            showspikes=True,
+            spikemode='across',
+            spikesnap='cursor',
+            spikedash='dash',
+            spikethickness=1,
+            spikecolor='#555'
+        ),
+        yaxis=dict(gridcolor='#1a1a1a', side='left', title=f'Macro: {feat_name}'),
+        yaxis2=dict(gridcolor='#1a1a1a', overlaying='y', side='right', title='Forward Return (Annualized)', tickformat='.0%')
+    )
+    return fig
+
+
+def plot_driver_scatter(feat_data: pd.DataFrame, asset_returns: pd.DataFrame, 
+                        feat_name: str, asset: str, descriptions: dict = None) -> go.Figure:
+    """Scatter plot of Driver vs Asset Return, colored by decade."""
+    theme = create_theme()
+    
+    if feat_name not in feat_data.columns or asset not in asset_returns.columns:
+        return go.Figure()
+        
+    combined = pd.concat([feat_data[feat_name], asset_returns[asset]], axis=1).dropna()
+    if combined.empty:
+        return go.Figure()
+        
+    combined['Decade'] = (combined.index.year // 10 * 10).astype(str) + "s"
+    
+    base_var = feat_name.split('_')[0]
+    desc = descriptions.get(base_var, base_var) if descriptions else base_var
+    
+    fig = px.scatter(
+        combined, x=feat_name, y=asset, color='Decade',
+        trendline="ols",
+        title=f"Correlation Density: {feat_name} ({desc}) vs {asset}",
+        labels={feat_name: f"{feat_name}", asset: f"{asset} Fwd Return"},
+        color_discrete_sequence=px.colors.qualitative.Bold
+    )
+    
+    fig.update_layout(
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        font=theme['font'],
+        margin=dict(l=50, r=20, t=40, b=40),
+        height=400,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
+        xaxis=dict(gridcolor='#1a1a1a', title=feat_name),
+        yaxis=dict(gridcolor='#1a1a1a', title=f"{asset} Return", tickformat='.1%')
+    )
+    return fig
+
+
+def plot_rolling_correlation(feat_data: pd.DataFrame, asset_returns: pd.DataFrame, 
+                             feat_name: str, asset: str, window: int = 60) -> go.Figure:
+    """Plot 60-month rolling correlation between driver and asset."""
+    theme = create_theme()
+    
+    if feat_name not in feat_data.columns or asset not in asset_returns.columns:
+        return go.Figure()
+        
+    combined = pd.concat([feat_data[feat_name], asset_returns[asset]], axis=1).dropna()
+    if len(combined) < window:
+        return go.Figure()
+        
+    rolling_corr = combined[feat_name].rolling(window).corr(combined[asset])
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=rolling_corr.index, y=rolling_corr,
+        mode='lines', line=dict(color='#ff6b35', width=1.5),
+        fill='tozeroy', fillcolor='rgba(255, 107, 53, 0.1)',
+        name='Rolling Correlation'
+    ))
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="#444")
+    
+    fig.update_layout(
+        title=f"Rolling {window}M Correlation: {feat_name} vs {asset}",
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        font=theme['font'],
+        margin=dict(l=50, r=20, t=40, b=40),
+        height=300,
+        xaxis=dict(gridcolor='#1a1a1a'),
+        yaxis=dict(gridcolor='#1a1a1a', title='Correlation', range=[-1, 1])
+    )
+    return fig
+
+
+def plot_quintile_analysis(feat_data: pd.DataFrame, asset_returns: pd.DataFrame, 
+                           feat_name: str, asset: str, horizon_months: int = 12) -> go.Figure:
+    """Group asset returns into quintiles based on driver values."""
+    theme = create_theme()
+    
+    if feat_name not in feat_data.columns or asset not in asset_returns.columns:
+        return go.Figure()
+        
+    combined = pd.concat([feat_data[feat_name], asset_returns[asset]], axis=1).dropna()
+    if combined.empty:
+        return go.Figure()
+        
+    combined['Quintile'] = pd.qcut(combined[feat_name], 5, labels=['Q1 (Lowest)', 'Q2', 'Q3', 'Q4', 'Q5 (Highest)'])
+    quintile_avg = combined.groupby('Quintile')[asset].mean().reset_index()
+    
+    colors = ['#ff4757', '#ffa502', '#ced6e0', '#2ed573', '#1e90ff']
+    
+    fig = px.bar(
+        quintile_avg, x='Quintile', y=asset,
+        title=f"Quintile Analysis: {asset} {horizon_months}M Return by {feat_name} Bucket",
+        color='Quintile',
+        color_discrete_sequence=colors
+    )
+    
+    fig.update_layout(
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        font=theme['font'],
+        margin=dict(l=50, r=20, t=40, b=40),
+        height=350,
+        showlegend=False,
+        xaxis=dict(gridcolor='#1a1a1a', title=f"{feat_name} Quintiles"),
+        yaxis=dict(gridcolor='#1a1a1a', title=f'Avg {horizon_months}M Forward Return', tickformat='.1%')
+    )
+    return fig
+
+
+def plot_combined_driver_analysis(feat_data: pd.DataFrame, asset_returns: pd.DataFrame, 
+                                  feat_name: str, asset: str, descriptions: dict = None, 
+                                  window: int = 60, horizon_months: int = 12) -> go.Figure:
+    """Combined chart with shared X-axis: Top (Driver vs Asset), Bottom (Rolling Correlation)."""
+    theme = create_theme()
+    
+    if feat_name not in feat_data.columns or asset not in asset_returns.columns:
+        return go.Figure()
+        
+    combined = pd.concat([feat_data[feat_name], asset_returns[asset]], axis=1).dropna()
+    if combined.empty:
+        return go.Figure()
+        
+    macro_vals = combined[feat_name]
+    asset_vals = combined[asset]
+    rolling_corr = macro_vals.rolling(window).corr(asset_vals)
+    
+    base_var = feat_name.split('_')[0]
+    desc = descriptions.get(base_var, base_var) if descriptions else base_var
+    
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
+    )
+    
+    # 1. Top Panel: Dual Axis Comparison
+    # Macro series (left axis)
+    fig.add_trace(go.Scatter(
+        x=combined.index, y=macro_vals, name=feat_name,
+        mode='lines', line=dict(color='#00d26a', width=1.5),
+        hovertemplate="<b>" + feat_name + "</b>: %{y:.4f}<extra></extra>"
+    ), row=1, col=1, secondary_y=False)
+    
+    # Asset returns (right axis)
+    fig.add_trace(go.Scatter(
+        x=combined.index, y=asset_vals, name=asset,
+        mode='lines', line=dict(color='#4da6ff', width=1.5),
+        hovertemplate="<b>" + asset + f" {horizon_months}M Return</b>: %{{y:.2%}}<extra></extra>"
+    ), row=1, col=1, secondary_y=True)
+    
+    # 2. Bottom Panel: Rolling Correlation
+    fig.add_trace(go.Scatter(
+        x=rolling_corr.index, y=rolling_corr,
+        mode='lines', line=dict(color='#ff6b35', width=1.5),
+        fill='tozeroy', fillcolor='rgba(255, 107, 53, 0.1)',
+        name=f'{window}M Rolling Correlation',
+        hovertemplate="<b>Correlation</b>: %{y:.2f}<extra></extra>"
+    ), row=2, col=1)
+    
+    fig.add_hline(y=0, line_dash="dash", line_color="#444", row=2, col=1)
+    
+    # Layout updates
+    fig.update_layout(
+        title=dict(text=f"{feat_name} ({desc}) Analysis", 
+                  font=dict(family='IBM Plex Mono', size=12, color='#888')),
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=50, r=50, t=60, b=40),
+        height=550,
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
+        hovermode='x unified'
+    )
+    
+    # Axis styling
+    fig.update_xaxes(gridcolor='#1a1a1a', row=1, col=1)
+    fig.update_xaxes(gridcolor='#1a1a1a', row=2, col=1)
+    fig.update_yaxes(title_text=f"Macro: {feat_name}", gridcolor='#1a1a1a', row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text=f"{horizon_months}M Fwd Return", gridcolor='#1a1a1a', tickformat='.0%', row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text=f"{window}M Correlation", gridcolor='#1a1a1a', range=[-1, 1], row=2, col=1)
+    
+    return fig
+
+
 # ============================================================================
-# MAIN APPLICATION
+# MAIN
+# ============================================================================
+
+def plot_variable_survival(stability_results_map: dict, asset: str, descriptions: dict = None) -> go.Figure:
+    """
+    Charts how often each variable was selected in the Walk-Forward/Rolling tests.
+    This proves which variables are "Real" and which were just noise.
+    """
+    theme = create_theme()
+    
+    if asset not in stability_results_map:
+        return go.Figure().update_layout(title="No stability data available", **theme)
+    
+    # Extract coefficients history
+    coef_df = stability_results_map[asset].get('all_coefficients', pd.DataFrame())
+    
+    if coef_df.empty:
+        return go.Figure().update_layout(title="No selection history available", **theme)
+    
+    # Count non-zero occurrences for each feature
+    # We ignore 'const' if present
+    feature_cols = [c for c in coef_df.columns if c != 'const']
+    counts = (coef_df[feature_cols].fillna(0) != 0).sum().sort_values(ascending=True)
+    
+    # Filter only those that survived at least once
+    counts = counts[counts > 0]
+    
+    if counts.empty:
+        return go.Figure().update_layout(title="No drivers survived the stability test", **theme)
+    
+    # Prepare labels with descriptions if available
+    labels = []
+    for feat in counts.index:
+        desc = descriptions.get(feat.split('_')[0], feat) if descriptions else feat
+        labels.append(f"<b>{feat}</b><br><span style='font-size:9px; color:#666;'>{desc}</span>")
+    
+    # Create the chart
+    fig = go.Figure(go.Bar(
+        x=counts.values,
+        y=labels,
+        orientation='h',
+        marker=dict(
+            color=counts.values,
+            colorscale='Oranges',
+            line=dict(color='#0a0a0a', width=1)
+        ),
+        text=counts.values,
+        textposition='auto',
+    ))
+    
+    # Create the chart with combined layout settings
+    layout_args = theme.copy()
+    layout_args.update({
+        'title': dict(
+            text=f"VARIABLE SURVIVAL LEADERBOARD - {asset}",
+            font=dict(size=14, color='#ff6b35')
+        ),
+        'xaxis_title': "Number of Windows Selected",
+        'margin': dict(l=20, r=20, t=60, b=40),
+        'height': 400 + (len(counts) * 15),
+    })
+    
+    # Update yaxis from theme with showgrid=False
+    if 'yaxis' in layout_args:
+        layout_args['yaxis'] = {**layout_args['yaxis'], 'showgrid': False}
+    else:
+        layout_args['yaxis'] = dict(showgrid=False)
+        
+    fig.update_layout(**layout_args)
+    
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def run_collective_analysis(y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months):
+    """
+    Runs the full analysis for all assets in one go and caches the results.
+    This prevents mid-rerun layout shifts that can reset st.tabs.
+    """
+    expected_returns = {}
+    confidence_intervals = {}
+    driver_attributions = {}
+    stability_results_map = {}
+    model_stats = {}
+    
+    for asset in ['EQUITY', 'BONDS', 'GOLD']:
+        y_asset = y[asset]
+        
+        # Stability Analysis (Rolling Windows)
+        stab_results = stability_analysis(y_asset, X, horizon_months=horizon_months, window_years=estimation_window_years)
+        metrics = compute_stability_metrics(stab_results, X.columns)
+        
+        # Stability Selection (Full Sample Bootstrapping)
+        stable_features, selection_probs = select_features_elastic_net(
+            y_asset.dropna(), 
+            X.loc[y_asset.dropna().index],
+            threshold=min_persistence,
+            l1_ratio=l1_ratio
+        )
+        
+        # Final Asset-Specific Estimation
+        y_valid = y_asset.dropna()
+        X_valid = X.loc[y_valid.index]
+        
+        # RESTRICT TO STABLE FEATURES ONLY
+        if stable_features:
+            X_valid = X_valid[stable_features]
+            X_current = X.tail(1)[stable_features]
+        else:
+            # Fallback to all if somehow empty (though selection logic avoids this)
+            X_current = X.tail(1)
+
+        win = Winsorizer(threshold=3.0)
+        X_valid_clean = win.fit_transform(X_valid)
+        X_current_clean = win.transform(X_current)
+        
+        if asset == 'EQUITY':
+            model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42)
+            model.fit(X_valid_clean, y_valid)
+            exp_ret = model.predict(X_current_clean)[0]
+            prediction_se = np.std(y_valid - model.predict(X_valid_clean))
+            hac_results = {
+                'model': model,
+                'coefficients': pd.Series(0, index=X_valid.columns.tolist() + ['const']),
+                'intercept': 0,
+                'importance': pd.Series(model.feature_importances_, index=X_valid.columns)
+            }
+            beta = hac_results['importance']
+            selected_features = X_valid.columns.tolist()
+        elif asset == 'BONDS':
+            model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=5000)
+            model.fit(X_valid_clean, y_valid)
+            exp_ret = model.predict(X_current_clean)[0]
+            prediction_se = np.std(y_valid - model.predict(X_valid_clean))
+            hac_results = {
+                'model': model,
+                'coefficients': pd.Series(model.coef_, index=X_valid.columns),
+                'intercept': model.intercept_
+            }
+            beta = pd.Series(model.coef_, index=X_valid.columns)
+            selected_features = beta[beta != 0].index.tolist()
+        else: # GOLD
+            model = LinearRegression()
+            model.fit(X_valid_clean, y_valid)
+            exp_ret = model.predict(X_current_clean)[0]
+            prediction_se = np.std(y_valid - model.predict(X_valid_clean))
+            hac_results = {
+                'model': model,
+                'coefficients': pd.Series(model.coef_, index=X_valid.columns),
+                'intercept': model.intercept_
+            }
+            beta = pd.Series(model.coef_, index=X_valid.columns)
+            selected_features = beta[beta != 0].index.tolist()
+
+        # CI calculation
+        t_stat = 1.645 # 90% approx
+        expected_returns[asset] = exp_ret
+        confidence_intervals[asset] = [exp_ret - t_stat * prediction_se, exp_ret + t_stat * prediction_se]
+        
+        # Attribution
+        attr_data = []
+        for feat in selected_features:
+            val = X_current_clean[feat].iloc[0]
+            coef = beta[feat]
+            impact = val * coef
+            attr_data.append({
+                'feature': feat,
+                'Impact': impact,
+                'State': val,
+                'Weight': coef,
+                'Signal': 'BULLISH' if impact > 0.005 else 'BEARISH' if impact < -0.005 else 'NEUTRAL',
+                'Link': metrics[feat]['correlation'] if feat in metrics else 0
+            })
+        driver_attributions[asset] = pd.DataFrame(attr_data).sort_values('Impact', ascending=False)
+        stability_results_map[asset] = {
+            'metrics': metrics,
+            'stable_features': stable_features,
+            'hac_results': hac_results,
+            'all_coefficients': pd.DataFrame([res['coefficients'] for res in stab_results])
+        }
+        model_stats[asset] = hac_results
+
+    return expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats
+
+
+def plot_backtest(actual_returns: pd.Series, 
+                  predicted_returns: pd.Series,
+                  confidence_lower: pd.Series,
+                  confidence_upper: pd.Series,
+                  confidence_level: float = 0.90) -> go.Figure:
+    """
+    Plot predicted vs actual forward returns with bottom-anchored minimal hover labels.
+    """
+    fig = go.Figure()
+    
+    # Calculate CI margin for hover
+    ci_margin = (confidence_upper - confidence_lower) / 2
+    
+    # 1. VISIBLE TRACES (Hover Disabled)
+    # Confidence band
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=confidence_upper,
+        mode='lines',
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=confidence_lower,
+        mode='lines',
+        line=dict(width=0),
+        fill='tonexty',
+        fillcolor='rgba(77, 166, 255, 0.2)',
+        name=f'{int(confidence_level*100)}% CI',
+        hoverinfo='skip'
+    ))
+    
+    # Predicted
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=predicted_returns,
+        mode='lines',
+        line=dict(color='#4da6ff', width=2),
+        name='Predicted',
+        hoverinfo='skip'
+    ))
+    
+    # Actual
+    fig.add_trace(go.Scatter(
+        x=actual_returns.index,
+        y=actual_returns,
+        mode='lines',
+        line=dict(color='#ff6b35', width=2),
+        name='Actual',
+        hoverinfo='skip'
+    ))
+    
+    # 2. GHOST HOVER TRACES (Anchored at Bottom)
+    # Using a secondary hidden y-axis [0, 1] to pin labels to the bottom (y=0.05)
+    hover_y = 0.05
+    
+    # Pred Hover
+    fig.add_trace(go.Scatter(
+        x=predicted_returns.index,
+        y=[hover_y] * len(predicted_returns),
+        yaxis='y2',
+        name='Pred',
+        mode='markers',
+        marker=dict(size=0, opacity=0),
+        showlegend=False,
+        hovertemplate="<b>Pred</b>: %{customdata:.1%}<extra></extra>",
+        customdata=predicted_returns
+    ))
+    
+    # Act Hover
+    fig.add_trace(go.Scatter(
+        x=actual_returns.index,
+        y=[hover_y] * len(actual_returns),
+        yaxis='y2',
+        name='Act',
+        mode='markers',
+        marker=dict(size=0, opacity=0),
+        showlegend=False,
+        hovertemplate="<b>Act</b>: %{customdata:.1%}<extra></extra>",
+        customdata=actual_returns
+    ))
+    
+    theme = create_theme()
+    fig.update_layout(
+        paper_bgcolor=theme['paper_bgcolor'],
+        plot_bgcolor=theme['plot_bgcolor'],
+        margin=dict(l=50, r=20, t=30, b=40),
+        height=350,
+        hovermode='x',
+        hoverlabel=dict(
+            bgcolor='rgba(0,0,0,0.6)',
+            font=dict(family='IBM Plex Mono', size=11)
+        ),
+        xaxis=dict(
+            gridcolor='#1a1a1a',
+            showspikes=True,
+            spikemode='across',
+            spikesnap='cursor',
+            spikedash='dash',
+            spikethickness=1,
+            spikecolor='#555'
+        ),
+        yaxis=dict(gridcolor='#1a1a1a', title='Annualized Return'),
+        yaxis2=dict(
+            range=[0, 1],
+            overlaying='y',
+            visible=False,
+            fixedrange=True
+        ),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0)
+    )
+    
+    return fig
+
+
+def construct_model_summary(asset: str, model_stats: dict) -> str:
+    """
+    Constructs a readable summary of the model (Equation or Feature Importance).
+    """
+    if asset not in model_stats:
+        return "Model details not available."
+    
+    m_info = model_stats[asset]
+    
+    if asset == 'EQUITY':
+        # Random Forest: Show Feature Importance
+        importance = m_info.get('importance', pd.Series())
+        if importance.empty:
+            return "Non-linear Ensemble (Random Forest). Variable sensitivities are dynamic."
+        
+        top_5 = importance.sort_values(ascending=False).head(5)
+        summary = "**Architecture: Random Forest (Non-Linear Ensemble)**\n\n"
+        summary += "Top Predictive Drivers (Feature Importance):\n"
+        for feat, imp in top_5.items():
+            summary += f"- {feat}: `{imp:.4f}`\n"
+        return summary
+    
+    else:
+        # Linear Models (BONDS, GOLD): Show Equation
+        intercept = m_info.get('intercept', 0)
+        coefs = m_info.get('coefficients', pd.Series())
+        
+        if coefs.empty:
+            return "Linear Model. Coefficients not available."
+        
+        # Filter significant coefficients (|coef| > 1e-6)
+        sig_coefs = coefs[coefs.abs() > 1e-6]
+        if 'const' in sig_coefs:
+            sig_coefs = sig_coefs.drop('const')
+            
+        arch_name = "ElasticNet (Regularized Linear)" if asset == 'BONDS' else "Simple OLS (Linear Regression)"
+        equation = f"**Architecture: {arch_name}**\n\n"
+        equation += f"Predicted Return = `{intercept:.4f}`"
+        
+        for feat, val in sig_coefs.items():
+            sign = "+" if val >= 0 else "-"
+            equation += f" {sign} (`{abs(val):.4f}` * {feat})"
+            
+        return equation
+
+
+def generate_narrative(expected_returns: dict,
+                       driver_attributions: dict,
+                       regime_status: str) -> str:
+    """
+    Generate human-readable summary of the analysis.
+    """
+    narratives = []
+    
+    for asset in ['EQUITY', 'BONDS', 'GOLD']:
+        if asset not in expected_returns or asset not in driver_attributions:
+            continue
+            
+        exp_ret = expected_returns[asset]
+        attr = driver_attributions[asset]
+        
+        tailwinds = attr[attr['Impact'] > 0.005].sort_values('Impact', ascending=False).head(2)
+        headwinds = attr[attr['Impact'] < -0.005].sort_values('Impact', ascending=True).head(2)
+        
+        # Extract feature names (remove transformation suffixes for display)
+        tailwind_list = [f.split('_')[0] for f in tailwinds['feature'].tolist()]
+        headwind_list = [f.split('_')[0] for f in headwinds['feature'].tolist()]
+        
+        tailwind_str = ', '.join(tailwind_list) or 'none'
+        headwind_str = ', '.join(headwind_list) or 'none'
+        
+        narratives.append(
+            f"**{asset}** ({exp_ret:.1%} expected): "
+            f"Tailwinds from {tailwind_str}; headwinds from {headwind_str}."
+        )
+    
+    regime_note = {
+        'CALM': 'Regime is stable, no defensive adjustment needed.',
+        'WARNING': 'Elevated stress detected, modest defensive tilt applied.',
+        'ALERT': 'High stress regime, significant defensive positioning.'
+    }.get(regime_status, 'Regime status unknown.')
+    
+    return '\n\n'.join(narratives) + f'\n\n{regime_note}'
+
+
+# ============================================================================
+# MAIN
 # ============================================================================
 
 def main():
-    # Header
-    st.markdown("""
-    <div class="header-container">
-        <p class="header-title">◈ HIGH-DIMENSIONAL ADAPTIVE SPARSE ELASTIC NET VECM</p>
-        <p class="header-subtitle">STRATEGIC ASSET ALLOCATION SYSTEM · US EQUITIES / BONDS / GOLD</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.set_page_config(
+        page_title="VECM Strategic Allocation",
+        page_icon="◈",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
     
-    # Sidebar configuration
+    # Sidebar Configuration (Moved up for header visibility)
     with st.sidebar:
         st.markdown("""
         <div style="padding: 1rem 0; border-bottom: 1px solid #2a2a2a; margin-bottom: 1rem;">
-            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 0.8rem; color: #ff6b35;">
-                CONFIGURATION
-            </span>
+            <span style="font-family: 'IBM Plex Mono'; font-size: 0.8rem; color: #ff6b35;">CONFIG</span>
         </div>
         """, unsafe_allow_html=True)
         
-        st.markdown("##### Model Parameters")
+        horizon_months = st.slider("Horizon (Months)", 3, 36, 12, help="Forward return horizon")
+        l1_ratio = st.slider("L1 Ratio", 0.1, 0.9, 0.5, 0.1, help="Elastic Net mixing parameter")
+        min_persistence = st.slider("Min Persistence", 0.3, 0.9, 0.6, 0.1, help="Feature selection threshold")
+        confidence_level = st.slider("Confidence Level", 0.80, 0.95, 0.90, 0.05)
+        estimation_window_years = st.slider("Estimation Window (Years)", 15, 35, 25)
         
-        l1_ratio = st.slider(
-            "L1/L2 Ratio (Elastic Net)",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.3,
-            step=0.05,
-            help="Lower = Ridge-heavy (grouped selection). Higher = Lasso-heavy (sparsity)."
-        )
-        
-        alpha = st.slider(
-            "Regularization Strength (α)",
-            min_value=0.001,
-            max_value=0.5,
-            value=0.005,
-            step=0.001,
-            help="Overall penalty strength."
-        )
-        
-        decay = st.slider(
-            "Temporal Decay (λ)",
-            min_value=0.9,
-            max_value=0.99,
-            value=0.98,
-            step=0.01,
-            help="Exponential weighting for recent observations."
-        )
-        
-        st.markdown("##### Sentinel Thresholds")
-        
-        alert_threshold = st.slider(
-            "Alert Threshold",
-            min_value=1.5,
-            max_value=4.0,
-            value=2.5,
-            step=0.1,
-            help="Stress score threshold for emergency rebalancing."
-        )
-        
-        st.markdown("##### Data Settings")
-        
-        n_periods_label = st.selectbox(
-            "Visual History",
-            options=["60m", "120m", "240m", "480m", "Full"],
-            index=1,
-            help="Select the time window for dashboard charts. The model always trains on the full common history."
-        )
-        
-        # Map labels to numeric months
-        n_periods_map = {"60m": 60, "120m": 120, "240m": 240, "480m": 480, "Full": 10000}
-        n_periods = n_periods_map[n_periods_label]
-        
-        run_model = st.button("⟳ RUN MODEL", width='stretch')
+        alert_threshold = st.slider("Alert Threshold", 1.0, 3.0, 2.0, 0.25)
+        risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", 0.0, 10.0, 4.0) / 100
     
-    # Load/Generate Data
-    macro_data = load_fred_md_data_safe()
     
-    # Extra safety: ensure no infinite values persist
-    if not macro_data.empty:
-        macro_data = macro_data.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        
-    # Load the full history (since 1960)
-    full_asset_history = get_long_history_assets()
+    st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+    
+    :root {
+        --bg-primary: #0a0a0a;
+        --bg-secondary: #111111;
+        --bg-tertiary: #1a1a1a;
+        --border-color: #2a2a2a;
+        --text-primary: #e8e8e8;
+        --text-secondary: #888888;
+        --text-muted: #555555;
+        --accent-orange: #ff6b35;
+        --accent-green: #00d26a;
+        --accent-red: #ff4757;
+        --accent-blue: #4da6ff;
+        --accent-gold: #ffd700;
+    }
+    
+    .stApp {
+        background-color: var(--bg-primary);
+        font-family: 'IBM Plex Sans', sans-serif;
+    }
+    
+    .main .block-container {
+        padding: 1rem 2rem;
+        max-width: 100%;
+    }
+    
+    .header-container {
+        background: linear-gradient(180deg, #111111 0%, #0a0a0a 100%);
+        border-bottom: 1px solid var(--border-color);
+        padding: 1rem 0;
+        margin-bottom: 1.5rem;
+    }
+    
+    .header-title {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: var(--accent-orange);
+        letter-spacing: 0.5px;
+        margin: 0;
+    }
+    
+    .header-subtitle {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+        letter-spacing: 1px;
+        margin-top: 0.25rem;
+    }
+    
+    .panel-header {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        border-bottom: 1px solid var(--border-color);
+        padding-bottom: 0.5rem;
+        margin-bottom: 0.75rem;
+    }
+    
+    .metric-card {
+        background-color: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 2px;
+        padding: 0.75rem;
+        text-align: center;
+    }
+    
+    .metric-label {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.65rem;
+        color: var(--text-muted);
+        letter-spacing: 1px;
+        text-transform: uppercase;
+    }
+    
+    .metric-value {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin-top: 0.25rem;
+    }
+    
+    .metric-value.positive { color: var(--accent-green); }
+    .metric-value.negative { color: var(--accent-red); }
+    .metric-value.warning { color: var(--accent-orange); }
+    
+    .data-table {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.75rem;
+        width: 100%;
+        border-collapse: collapse;
+    }
+    
+    .data-table th {
+        background-color: var(--bg-tertiary);
+        color: var(--text-secondary);
+        font-weight: 500;
+        text-transform: uppercase;
+        padding: 0.5rem;
+        border-bottom: 1px solid var(--border-color);
+        text-align: left;
+    }
+    
+    .data-table td {
+        color: var(--text-primary);
+        padding: 0.5rem;
+        border-bottom: 1px solid var(--border-color);
+    }
+    
+    section[data-testid="stSidebar"] {
+        background-color: var(--bg-secondary);
+        border-right: 1px solid var(--border-color);
+    }
+    
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    .stButton > button {
+        background-color: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.75rem;
+        transition: all 0.2s;
+    }
+    
+    .stButton > button:hover {
+        background-color: var(--accent-orange);
+        border-color: var(--accent-orange);
+        color: #000;
+    }
+    
+    .stTabs [data-baseweb="tab-list"] { background-color: var(--bg-secondary); gap: 0; }
+    
+    .stTabs [data-baseweb="tab"] {
+        background-color: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        color: var(--text-secondary);
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.7rem;
+        padding: 0 20px;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: var(--bg-primary);
+        color: var(--accent-orange);
+        border-bottom-color: var(--bg-primary);
+    }
+    
+    .debug-box {
+        background: #1a1a1a;
+        border: 1px solid #333;
+        padding: 0.75rem;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.75rem;
+        color: #888;
+        margin: 0.5rem 0;
+        border-radius: 2px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    # Align with Macro Data (FRED-MD)
-    # The intersection ensures we have both Macro AND Asset data for every row
-    common_index = macro_data.index.intersection(full_asset_history.index)
+    st.markdown(f"""
+    <div class="header-container">
+        <p class="header-title">◈ VECM STRATEGIC ALLOCATION</p>
+        <p class="header-subtitle">FORWARD RETURN PREDICTION · {horizon_months}-MONTH HORIZON</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Load data
+    macro_data = load_fred_md_data()
+    asset_prices = load_asset_data()
+    descriptions = get_series_descriptions()
+    
+    if macro_data.empty or asset_prices.empty:
+        st.error("Failed to load required data.")
+        return
+    
+    common_idx = macro_data.index.intersection(asset_prices.index)
+    macro_data = macro_data.loc[common_idx]
+    asset_prices = asset_prices.loc[common_idx]
+    
+    # 1. Feature Preparation
+    macro_features = prepare_macro_features(macro_data)
+    y_forward = compute_forward_returns(asset_prices, horizon_months=horizon_months)
+    
+    # Align again because of lags and forward shifts
+    valid_idx = macro_features.index.intersection(y_forward.index)
+    X = macro_features.loc[valid_idx]
+    y = y_forward.loc[valid_idx]
+    
+    # 2. Main Analysis Loop (Synchronized & Cached)
+    with st.spinner("Synchronizing Macro Models..."):
+        expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats = run_collective_analysis(
+            y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months
+        )
+            
+    # 3. Regime and Allocation
+    regime_status, stress_score, stress_indicators = evaluate_regime(macro_data, alert_threshold=alert_threshold)
+    target_weights = compute_allocation(expected_returns, confidence_intervals, regime_status, risk_free_rate=risk_free_rate)
+    
+    # 4. Dashboard Implementation
+    
+    # Metrics row
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Regime", regime_status)
+    with m2:
+        st.metric("Stress Score", f"{stress_score:.2f}")
+    with m3:
+        st.metric("Risk-Free Rate", f"{risk_free_rate:.1%}")
+    with m4:
+        st.metric("Horizon", f"{horizon_months}m")
 
-    # Filter based on the window selected by the user (n_periods)
-    # Note: For model training, we want the full history to learn the equations,
-    # but for the visual "Asset Data" tab, we might show n_periods.
-    # HERE: We slice for the VECM using the full common history.
-    asset_prices = full_asset_history.loc[common_index]
-    
-    # Initialize model components
-    kernel_dict = KernelDictionary()
-    sentinel = RegimeSentinel(lookback=60, alert_threshold=alert_threshold)
-    vecm = AdaptiveElasticNetVECM(l1_ratio=l1_ratio, alpha=alpha, decay=decay)
-    allocator = PortfolioAllocator()
-    
-    # Run pipeline
-    # Step 1: Preprocess
-    levels = macro_data.copy()
-    changes = macro_data.diff().dropna()
-    
-    # Step 2: Sentinel evaluation
-    status, stress_score, stress_indicators = sentinel.evaluate(macro_data)
-    
-    # Step 3: Kernel transformation
-    kernel_features = kernel_dict.transform(macro_data)
-    
-    # Step 4: Cointegration
-    coint_results = vecm.estimate_cointegration(levels)
-    
-    # Step 5: ECT computation
-    ect = vecm.compute_ect(levels)
-    
-    # Step 6: Gamma estimation
-    gamma, macro_fitted = vecm.estimate_gamma(changes, kernel_features)
-    active_vars = (gamma.values != 0).sum()
-    
-    # Step 7: Portfolio signals
-    signals = allocator.generate_signals(ect, status, stress_score)
-
-    # Step 8: Asset Equations (New)
-    asset_returns = np.log(asset_prices).diff().dropna()
-    # Align data
-    common_idx = asset_returns.index.intersection(kernel_features.index)
-    asset_gamma, asset_fitted = vecm.estimate_gamma(asset_returns.loc[common_idx], kernel_features.loc[common_idx])
-    
-    # =========================================================================
-    # DASHBOARD LAYOUT
-    # =========================================================================
-    
-    # Top row: Key metrics
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Sentinel Status</div>
-            <div class="metric-value {'positive' if status == 'CALM' else 'warning' if status == 'WARNING' else 'negative'}">{status}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Stress Score</div>
-            <div class="metric-value {'positive' if stress_score < 1.5 else 'warning' if stress_score < 2.5 else 'negative'}">{stress_score:.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Coint. Rank</div>
-            <div class="metric-value">{coint_results['rank']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        ect_current = ect.iloc[-1] if len(ect) > 0 else 0
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">ECT (Current)</div>
-            <div class="metric-value {'positive' if ect_current > 0 else 'negative'}">{ect_current:+.3f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col5:
-        rebal = "EMERGENCY" if signals['rebalance_trigger'] else "SCHEDULED"
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Rebalance</div>
-            <div class="metric-value {'negative' if signals['rebalance_trigger'] else 'positive'}">{rebal}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
-    
-    # Main content tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["ALLOCATION", "MACRO REGIME", "SERIES", "MODEL DIAGNOSTICS", "ALGORITHM STEPS", "AUDIT", "SPECS"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "SERIES", "BACKTEST", "DIAGNOSTICS"])
     
     with tab1:
-        col_left, col_right = st.columns([1, 2])
+        st.markdown(f'<div class="panel-header">EXPECTED {horizon_months}M RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
         
-        with col_left:
-            st.markdown('<div class="panel-header">TARGET ALLOCATION</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_allocation_chart(signals['weights']), width="stretch", config={'displayModeBar': False})
+        # summary_panel
+        summary_data = []
+        for asset in ['EQUITY', 'BONDS', 'GOLD']:
+            exp = expected_returns[asset]
+            ci = confidence_intervals[asset]
+            # Historical avg (approx)
+            avg_ret = y[asset].mean()
+            diff = exp - avg_ret
+            rec = "OVERWEIGHT" if diff > 0.01 else "UNDERWEIGHT" if diff < -0.01 else "NEUTRAL"
             
-            # Weights table
-            st.markdown("""
-            <table class="data-table">
-                <tr><th>Asset</th><th>Weight</th><th>Signal</th></tr>
-            """ + "".join([
-                f"<tr><td style='color: {'#ff6b35' if k == 'EQUITY' else '#4da6ff' if k == 'BONDS' else '#ffd700'}'>{k}</td><td>{v:.1%}</td><td>{'▲' if v > 0.4 else '▼' if v < 0.2 else '●'}</td></tr>"
-                for k, v in signals['weights'].items()
-            ]) + "</table>", unsafe_allow_html=True)
-            
-            st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
-            
-            st.markdown('<div class="panel-header">STRESS GAUGE</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_stress_gauge(stress_score, status), width="stretch", config={'displayModeBar': False})
+            summary_data.append({
+                'Asset': asset,
+                'Expected Return': f"{exp:.1%}",
+                f'{int(confidence_level*100)}% CI': f"[{ci[0]:.1%}, {ci[1]:.1%}]",
+                'vs Historical': f"{diff:+.1%}",
+                'Recommendation': rec,
+                'Target Weight': f"{target_weights[asset]:.0%}"
+            })
+        st.dataframe(pd.DataFrame(summary_data), hide_index=True, width='stretch')
         
-        with col_right:
-            st.markdown('<div class="panel-header">ASSET PERFORMANCE (INDEXED)</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_asset_performance(asset_prices.tail(min(n_periods, len(asset_prices)))), width="stretch", config={'displayModeBar': False})
+        # Allocation Charts
+        col_c1, col_c2 = st.columns([1, 2])
+        with col_c1:
+            st.plotly_chart(plot_allocation(target_weights), width='stretch')
+        with col_c2:
+            st.markdown('<div class="panel-header">STRATEGIC RATIONALE</div>', unsafe_allow_html=True)
+            narrative = generate_narrative(expected_returns, driver_attributions, regime_status)
+            st.markdown(f"""
+            <div style="background:#111; border:1px solid #2a2a2a; padding:1rem; border-radius:2px; font-size:0.85rem; color:#ccc;">
+                {narrative}
+            </div>
+            """, unsafe_allow_html=True)
             
-            st.markdown('<div class="panel-header">ERROR CORRECTION TERM</div>', unsafe_allow_html=True)
-            st.plotly_chart(plot_ect_series(ect), width="stretch", config={'displayModeBar': False})
-    
     with tab2:
-        # Compute history for plotting
-        regime_history = sentinel.compute_history(macro_data)
-        
-        st.markdown('<div class="panel-header">REGIME TIMELINE</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_regime_timeline(macro_data, regime_history), width="stretch", config={'displayModeBar': False})
-        
-        st.markdown('<div class="panel-header">MACRO INDICATORS HEATMAP (Z-SCORES)</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_macro_heatmap(macro_data), width="stretch", config={'displayModeBar': False})
-        
-        # Stress indicators breakdown
-        st.markdown('<div class="panel-header">STRESS DECOMPOSITION</div>', unsafe_allow_html=True)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        indicators_display = [
-            ("Credit Stress", stress_indicators['credit_stress']),
-            ("Curve Stress", stress_indicators['curve_stress']),
-            ("Production Stress", stress_indicators['production_stress']),
-            ("Employment Stress", stress_indicators['employment_stress'])
-        ]
-        
-        for col, (name, value) in zip([col1, col2, col3, col4], indicators_display):
-            with col:
-                color_class = 'positive' if value < 1 else 'warning' if value < 2 else 'negative'
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">{name}</div>
-                    <div class="metric-value {color_class}">{value:.2f}</div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        # Cycle signatures
-        st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="panel-header">CYCLE SIGNATURES (GROUPED VARIABLES)</div>', unsafe_allow_html=True)
-        
-        cycle_data = pd.DataFrame({
-            'Block': ['Labor', 'Output', 'Prices', 'Financial', 'Housing'],
-            'Variables': ['PAYEMS, USPRIV', 'INDPRO, IPFINAL', 'CPI, PPI', 'SPREAD, BAA_AAA', 'HOUST, M2'],
-            'Regime': ['Plateau', 'Slowdown', 'Sticky', 'Easing', 'Weak'],
-            'Interpretation': [
-                'End of expansion cycle confirmation',
-                'Production indicators converging lower',
-                'Persistent inflationary pressures',
-                'Credit conditions moderating',
-                'Housing sector showing weakness'
-            ]
-        })
-        
-        st.dataframe(
-            cycle_data,
-            hide_index=True,
-            width='stretch',
-            column_config={
-                'Block': st.column_config.TextColumn('FRED-MD Block', width='small'),
-                'Variables': st.column_config.TextColumn('Grouped Variables', width='medium'),
-                'Regime': st.column_config.TextColumn('Detected Regime', width='small'),
-                'Interpretation': st.column_config.TextColumn('Strategic Interpretation', width='large')
-            }
-        )
+        st.markdown(f'<div class="panel-header">STABLE MACRO DRIVERS (PERSISTENCE > {int(min_persistence*100)}%)</div>', unsafe_allow_html=True)
+        for asset in ['EQUITY', 'BONDS', 'GOLD']:
+            with st.expander(f"Drivers & Equation for {asset}", expanded=(asset=='EQUITY')):
+                # Display Equation / Summary
+                st.markdown(construct_model_summary(asset, model_stats))
+                st.divider()
+                
+                attr = driver_attributions[asset]
+                # Filter for stable features only
+                stable_feats = stability_results_map[asset].get('stable_features', [])
+                attr = attr[attr['feature'].isin(stable_feats)].copy()
+                # Add absolute impact for sorting if needed, but we keep Impact column
+                attr['AbsWeight'] = attr['Weight'].abs()
+                attr = attr.sort_values('AbsWeight', ascending=False)
+
+                selection = st.dataframe(
+                    attr[['feature', 'Signal', 'Impact', 'Weight', 'State', 'Link']], 
+                    hide_index=True, 
+                    width='stretch',
+                    on_select='rerun',
+                    selection_mode='single-row',
+                    key=f"df_selection_{asset}",
+                    column_config={
+                        'feature': st.column_config.TextColumn("Driver", width="medium"),
+                        'Signal': st.column_config.TextColumn("Current Signal", width="small"),
+                        'Impact': st.column_config.NumberColumn("Impact", format="%.4f", help="Total contribution (Weight * State)"),
+                        'Weight': st.column_config.NumberColumn("Weight", format="%.3f", help="Predictive impact of the driver"),
+                        'State': st.column_config.NumberColumn("State (Z)", format="%.2f", help="Current Z-score of the macro driver"),
+                        'Link': st.column_config.NumberColumn("Link (Corr)", format="%.2f", help="Historical correlation with asset returns")
+                    }
+                )
+                
+                selected_rows = selection.get('selection', {}).get('rows', [])
+                if selected_rows:
+                    row_idx = selected_rows[0]
+                    selected_feat = attr.iloc[row_idx]['feature']
+                    
+                    st.plotly_chart(
+                        plot_combined_driver_analysis(macro_features, y_forward, selected_feat, asset, descriptions, horizon_months=horizon_months),
+                        width='stretch'
+                    )
+
+                    # NEW: Deep Dive Analysis Row 2 (Correlation & Quintiles side-by-side)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.plotly_chart(plot_driver_scatter(macro_features, y_forward, selected_feat, asset, descriptions), width='stretch')
+                    with c2:
+                        st.plotly_chart(plot_quintile_analysis(macro_features, y_forward, selected_feat, asset, horizon_months=horizon_months), width='stretch')
+                
+                # Stability Boxplot
+                st.plotly_chart(plot_stability_boxplot(stability_results_map, asset, descriptions), width='stretch')
+
+                # Step 3: Survival Leaderboard
+                st.plotly_chart(plot_variable_survival(stability_results_map, asset, descriptions), width='stretch')
 
     with tab3:
-        # Filter toggle
-        filter_choice = st.radio(
-            "Filter Series by Asset Equation Influence:",
-            options=["ALL", "EQUITY", "BONDS", "GOLD"],
-            horizontal=True,
-            index=0,
-            help="Show all series or only those with non-zero predictive power for the selected asset in this specific VECM estimation."
-        )
+        # Asset and Display Mode Selection on a single row
+        sel_col1, sel_col2, sel_col3, sel_col4, sel_col5, sel_col6 = st.columns([1.5, 1, 1, 1, 2, 3])
+        with sel_col1:
+            st.markdown("**Impact on:**")
+        with sel_col2:
+            f_equity = st.checkbox("Equity", value=True, key="check_equity")
+        with sel_col3:
+            f_bonds = st.checkbox("Bonds", value=False, key="check_bonds")
+        with sel_col4:
+            f_gold = st.checkbox("Gold", value=False, key="check_gold")
+        
+        with sel_col5:
+            st.markdown("**Display Mode:**")
+        with sel_col6:
+            display_mode = st.radio("Display Mode", ["Raw", "Transformed", "Normalized"], horizontal=True, key="series_display_mode", label_visibility="collapsed")
+
+        if display_mode == "Normalized":
+            st.info("💡 **Normalized Mode**: Displays point-in-time Z-scores using an expanding window (no look-ahead bias), with values clipped at ±3.0 standard deviations for optimal readability.")
+
 
         # Load raw data and appendix
         df_full, transform_codes = load_full_fred_md_raw()
         appendix = load_fred_appendix()
         
-        active_series = set()
-        if filter_choice != "ALL":
-            # Extract active features for the chosen asset from the estimated gamma matrix
-            asset_row = asset_gamma.loc[filter_choice]
-            # Consider features with non-zero coefficients
-            active_features = asset_row[asset_row != 0].index
-            
-            # Map features (e.g., 'PAYEMS_L1') back to original series names ('PAYEMS')
-            for feat in active_features:
-                for col in df_full.columns:
-                    if feat.startswith(col + "_"):
-                        active_series.add(col)
-                        break
+        active_series = {} # fred_md_symbol -> max_abs_importance (Weight)
         
-        if not df_full.empty:
-            # Group definitions from appendix
-            group_names = {
-                1: "Output and Income",
-                2: "Labor Market",
-                3: "Housing",
-                4: "Consumption, Orders and Inventories",
-                5: "Money and Credit",
-                6: "Interest Rates and Exchange Rates",
-                7: "Prices",
-                8: "Stock Market"
-            }
-            
-            # Map columns to groups (Case-Insensitive)
-            columns_by_group = {}
-            for col in df_full.columns:
-                group_id = 0
-                col_upper = col.upper()
-                if col_upper in appendix.index:
-                    try:
-                        group_id = int(appendix.loc[col_upper, 'group'])
-                    except:
-                        pass
-                
-                if group_id not in columns_by_group:
-                    columns_by_group[group_id] = []
-                columns_by_group[group_id].append(col)
-                
-            sorted_groups = sorted(columns_by_group.keys())
-            
-            for g_id in sorted_groups:
-                # Filter columns in this group based on asset selection
-                group_cols = columns_by_group[g_id]
-                if filter_choice != "ALL":
-                    group_cols = [c for c in group_cols if c in active_series]
-                
-                if not group_cols:
-                    continue
+        # Robust mapping from model core names back to FRED-MD raw symbols
+        name_to_fred = {
+            'PAYEMS': 'PAYEMS',
+            'UNRATE': 'UNRATE',
+            'INDPRO': 'INDPRO',
+            'CAPACITY': 'CUMFNS',
+            'CPI': 'CPIAUCSL',
+            'PPI': 'WPSFD49207',
+            'PCE': 'PCEPI',
+            'FEDFUNDS': 'FEDFUNDS',
+            'GS10': 'GS10',
+            'HOUST': 'HOUST',
+            'M2': 'M2SL'
+        }
+        # Reverse mapping for display
+        fred_to_name = {v: k for k, v in name_to_fred.items()}
+        fred_to_name.update({'BAA': 'BAA', 'AAA': 'AAA'})
 
-                # Standard FRED-MD groups are 1-8. Group 0 is for anything uncategorized.
-                if g_id == 0:
-                    g_name = "Uncategorized / Miscellaneous"
-                else:
-                    g_name = group_names.get(g_id, f"Group {g_id}")
+        # Longest names first to ensure correct prefix matching
+        target_names = sorted(list(name_to_fred.keys()) + ['SPREAD', 'BAA_AAA'], key=len, reverse=True)
+        
+        # If any specific asset is checked, we identify the top impactful drivers
+        selected_assets = [a for a in ['EQUITY', 'BONDS', 'GOLD'] if (f_equity if a=='EQUITY' else f_bonds if a=='BONDS' else f_gold)]
+
+        if selected_assets:
+            for asset in selected_assets:
+                attr = driver_attributions[asset].copy()
+                # We use ALL features from attributions to match the bullet points (which include all top imports)
+                attr['AbsWeight'] = attr['Weight'].abs()
                 
-                st.markdown(f'<div class="panel-header" style="font-size: 1rem; color: #ff6b35; border-bottom: 1px solid #2a2a2a; margin: 1.5rem 0 1rem 0;">GROUP {g_id}: {g_name.upper()}</div>', unsafe_allow_html=True)
-                
-                for col in group_cols:
-                    # Get description from appendix (Case-Insensitive)
-                    desc = col
-                    col_upper = col.upper()
-                    if col_upper in appendix.index:
-                        series_info = appendix.loc[col_upper]
-                        desc_str = series_info['description'] if isinstance(series_info, pd.Series) else series_info.iloc[0]['description']
-                        desc = f"{col}: {desc_str}"
+                # Map each feature back to one or more FRED-MD series
+                for _, row in attr.iterrows():
+                    feat = row['feature']
+                    weight = row['AbsWeight']
                     
-                    with st.expander(desc):
-                        tcode = 1
-                        if col in transform_codes:
-                            try:
-                                tcode = int(transform_codes[col])
-                            except:
-                                pass
-                        
-                        raw_data = df_full[col].dropna()
-                        trans_data = apply_transformation(raw_data, tcode).dropna()
-                        
-                        st.plotly_chart(
-                            plot_fred_series(raw_data, f"RAW: {col}", "LEVEL DATA", is_transformed=False),
-                            width='stretch', config={'displayModeBar': False}
-                        )
+                    # Identify base model name (e.g., HOUST_MA60 -> HOUST)
+                    base_name = None
+                    for tn in target_names:
+                        if feat == tn or feat.startswith(tn + "_"):
+                            base_name = tn
+                            break
                     
-                        t_label = get_transformation_label(tcode)
-                        st.plotly_chart(
-                            plot_fred_series(trans_data, f"TRANSFORMED: {col}", f"TCODE {tcode}: {t_label}", is_transformed=True),
-                            width='stretch', config={'displayModeBar': False}
-                        )
+                    if not base_name: 
+                        base_name = feat.split('_')[0]
+
+                    # Map to FRED-MD symbols
+                    fred_cols = []
+                    if base_name == 'SPREAD': fred_cols = ['GS10', 'FEDFUNDS']
+                    elif base_name == 'BAA_AAA': fred_cols = ['BAA', 'AAA']
+                    else: fred_cols = [name_to_fred.get(base_name, base_name)]
+                    
+                    for col in fred_cols:
+                        if col in df_full.columns:
+                            # Maintain the maximum weight encountered for this series
+                            if col not in active_series or weight > active_series[col]:
+                                active_series[col] = weight
+            
+            # Sort by absolute weight (decreasing) and take top 15
+            sorted_by_importance = sorted(active_series.items(), key=lambda x: x[1], reverse=True)
+            sorted_series = [s[0] for s in sorted_by_importance[:15]]
         else:
-            st.warning("Could not load full FRED-MD dataset.")
-    
-    with tab4:
-        st.markdown('<div class="panel-header">ASSET EQUATIONS</div>', unsafe_allow_html=True)
-        
-        # Definition mapping for annotations
-        def get_annotation(feature_name):
-            if 'M2' in feature_name: return 'Liquidity'
-            if 'CPI' in feature_name: return 'Inflation'
-            if 'PPI' in feature_name: return 'Inflation'
-            if 'INDPRO' in feature_name: return 'Growth'
-            if 'PAYEMS' in feature_name: return 'Labor'
-            if 'SPREAD' in feature_name: return 'Term Structure'
-            if 'FEDFUNDS' in feature_name: return 'Rates'
-            if 'BAA_AAA' in feature_name: return 'Credit Risk'
-            return 'Macro'
-        
-        for asset in asset_gamma.index:
-            row = asset_gamma.loc[asset]
-            intercept = vecm.intercepts.get(asset, 0.0)
+            # If no asset selected, show all alphabetically
+            sorted_series = sorted(list(df_full.columns))
+
+        if not df_full.empty and sorted_series:
+            num_series = len(sorted_series)
             
-            # Select top 5 features by absolute magnitude
-            top_features = row.abs().sort_values(ascending=False).head(5)
-            active_features = row[top_features.index]
+            # Create subplots with ABSOLUTE zero spacing and no external titles
+            fig = make_subplots(
+                rows=num_series, 
+                cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0 # True zero spacing for a contiguous vertical area
+            )
             
-            terms_latex = []
-            for feature, coef in active_features.items():
-                if abs(coef) < 0.0001: continue
-                # Tex friendly names
-                fname = feature.replace('_', r'\_')
-                annotation = get_annotation(feature)
-                sign = "+" if coef >= 0 else "-"
-                val = abs(coef)
+            for i, col in enumerate(sorted_series):
+                row = i + 1
+                tcode = 1
+                if col in transform_codes.index:
+                    try: tcode = int(transform_codes[col])
+                    except: pass
                 
-                term = fr"\underbrace{{{val:.4f} \cdot \text{{{fname}}}}}_{{\text{{{annotation}}}}}"
-                terms_latex.append((sign, term))
-            
-            if not terms_latex:
-                equation_str = "0"
-            else:
-                # Handle first term sign
-                first_sign, first_term = terms_latex[0]
-                eq_parts = []
-                if first_sign == "-":
-                    eq_parts.append(fr"- {first_term}")
+                raw_data = df_full[col].dropna()
+                if display_mode == "Raw":
+                    data = raw_data
                 else:
-                    eq_parts.append(first_term)
+                    data = apply_transformation(raw_data, tcode).dropna()
+                    if display_mode == "Normalized" and not data.empty:
+                        # Expanding window z-score (point-in-time vision)
+                        # We use a 12-month minimum window to establish a stable mean/std
+                        means = data.expanding(min_periods=12).mean()
+                        stds = data.expanding(min_periods=12).std()
+                        data = (data - means) / stds
+                        
+                        # Winsorization (Clip at +/- 3.0 for readability)
+                        data = data.clip(-3.0, 3.0)
                 
-                for sign, term in terms_latex[1:]:
-                    eq_parts.append(fr" {sign} {term}")
+                if data.empty: continue
                 
-                equation_str = "".join(eq_parts)
-            
-            # Asset symbol
-            asset_sym = "P_t^{" + asset + "}"
-            
-            st.latex(fr"\Delta \ln({asset_sym}) = {intercept:.4f} + {equation_str} + \epsilon_t")
-            
-            with st.expander(f"View {asset} Equation Analysis Chart"):
-                if asset in asset_fitted.columns:
-                    actual_asset = asset_returns[asset]
-                    fitted_asset = asset_fitted[asset]
-                    st.plotly_chart(
-                        plot_actual_vs_fitted(actual_asset, fitted_asset, asset),
-                        width="stretch",
-                        config={'displayModeBar': False}
+                # Get description for hover
+                desc = col
+                if col.upper() in appendix.index:
+                    series_info = appendix.loc[col.upper()]
+                    desc_str = series_info['description'] if isinstance(series_info, pd.Series) else series_info.iloc[0]['description']
+                    desc = f"{col}: {desc_str}"
+                
+                # Use display name if available (e.g. PPI instead of WPSFD49207)
+                display_name = fred_to_name.get(col, col)
+                
+                # Append transformation to name if in Transformed/Normalized mode
+                if display_mode in ["Transformed", "Normalized"]:
+                    label = TRANSFORMATION_LABELS.get(tcode, "Unknown")
+                    display_name = f"{display_name} ({label})"
+                    if display_mode == "Normalized":
+                        display_name += " [Z]"
+
+                color = '#4da6ff' if display_mode == "Raw" else '#ff4757' if display_mode == "Transformed" else '#00d26a'
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=data.index, 
+                        y=data.values,
+                        mode='lines',
+                        name=display_name,
+                        line=dict(color=color, width=1.5),
+                        hovertemplate=f'<b>{display_name}</b><br>%{{x|%b %Y}}<br>Value: %{{y:.4f}}<extra>{desc}</extra>'
+                    ),
+                    row=row, col=1
+                )
+                
+                # Get plain description for annotation
+                plain_desc = ""
+                if col.upper() in appendix.index:
+                    series_info = appendix.loc[col.upper()]
+                    plain_desc = series_info['description'] if isinstance(series_info, pd.Series) else series_info.iloc[0]['description']
+
+                # Add Internal Title (Annotation) with Description
+                annotation_text = f"<b>{display_name}</b>"
+                if plain_desc:
+                    annotation_text += f": {plain_desc}"
+
+                fig.add_annotation(
+                    text=annotation_text,
+                    xref=f"x{row if row > 1 else ''} domain", yref=f"y{row if row > 1 else ''} domain",
+                    x=0.01, y=0.95,
+                    showarrow=False,
+                    font=dict(color='#ff6b35', size=11, family='IBM Plex Mono'),
+                    bgcolor='rgba(0,0,0,0.6)',
+                    bordercolor='#2a2a2a',
+                    borderwidth=1,
+                    align='left'
+                )
+
+                # Add Recession Bands to each subplot
+                for start, end in NBER_RECESSIONS:
+                    fig.add_vrect(
+                        x0=start, x1=end,
+                        fillcolor="#ffffff", opacity=0.07,
+                        layer="below", line_width=0,
+                        row=row, col=1
                     )
-                else:
-                    st.info(f"Fitted values for {asset} not available.")
-                    
-            st.divider()
+            
+            theme = create_theme()
+            # Synchronize axes styling with high-visibility cross-subplot spikelines
+            fig.update_xaxes(
+                **theme['xaxis'],
+                showspikes=True,
+                spikemode='across', # Force the line across subplot gaps
+                spikesnap='cursor',
+                spikedash='solid',
+                spikecolor='rgba(255,255,255,0.8)', # Prominent white line
+                spikethickness=1,
+                showticklabels=False
+            )
+            # Only show ticks on the bottom-most plot
+            fig.update_xaxes(showticklabels=True, row=num_series, col=1)
+            
+            fig.update_yaxes(**theme['yaxis'])
 
-        col1, col2 = st.columns(2)
+            fig.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=40, r=20, t=10, b=40),
+                height=150 * num_series, # High density
+                showlegend=False,
+                hovermode='x', # Better for individual subplot spikeline triggers in zero-gap
+                hoverdistance=-1,
+                spikedistance=-1
+            )
+            
+            st.plotly_chart(fig, width='stretch', config={'displayModeBar': False})
+            
+            if len(active_series) > 15:
+                st.warning(f"Displaying {len(active_series)} series. Use asset filters to focus on key drivers.")
+
+    with tab4:
+        asset_to_plot = st.selectbox("Select Asset", ['EQUITY', 'BONDS', 'GOLD'], key="backtest_asset_select")
         
-        with col1:
-            st.markdown('<div class="panel-header">COINTEGRATION TEST RESULTS</div>', unsafe_allow_html=True)
-            
-            coint_df = pd.DataFrame({
-                'H0: r ≤': list(range(len(coint_results['eigenvalues']))),
-                'Eigenvalue': coint_results['eigenvalues'],
-                'Trace Stat': coint_results['trace_stats'],
-                'Critical (5%)': coint_results['critical_values'],
-                'Reject H0': ['Yes' if t > c else 'No' for t, c in zip(coint_results['trace_stats'], coint_results['critical_values'])]
-            })
-            
-            st.dataframe(coint_df, hide_index=True, width='stretch')
-            
-            st.markdown(f"""
-            <div style="margin-top: 0.5rem; padding: 0.75rem; background: #1a1a1a; border-radius: 2px;">
-                <span style="font-family: 'IBM Plex Mono'; font-size: 0.75rem; color: #888;">
-                    Estimated Cointegration Rank: <span style="color: #4da6ff; font-weight: 600;">{coint_results['rank']}</span>
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
+        model_display_names = {
+            'EQUITY': 'Random Forest (Non-Linear Ensemble)',
+            'BONDS': 'ElasticNetCV (Regularized Linear)',
+            'GOLD': 'Simple OLS (Linear Regression)'
+        }
+        st.info(f"Target Architecture: **{model_display_names.get(asset_to_plot)}** | Training Window: **240 Months**")
         
-        with col2:
-            st.markdown('<div class="panel-header">KERNEL DICTIONARY STRUCTURE</div>', unsafe_allow_html=True)
-            
-            kernel_info = pd.DataFrame({
-                'Type': ['Dense Lags', 'Dense Lags', 'Anchor 12M', 'Anchor 24M', 'Anchor 36M', 'Anchor 48M', 'Anchor 60M'],
-                'Lags': ['1-3', '4-6', '12', '24', '36', '48', '60'],
-                'Purpose': ['Immediate reactivity', 'Short-term dynamics', 'Annual cycle', 'Business cycle', 'Medium cycle', 'Long cycle', 'Secular trends'],
-                'Weighting': ['Direct', 'Direct', 'Gaussian', 'Gaussian', 'Gaussian', 'Gaussian', 'Gaussian']
-            })
-            
-            st.dataframe(kernel_info, hide_index=True, width='stretch')
+        # Run Walk-Forward Backtest (Cached)
+        with st.spinner(f"Running Walk-Forward Backtest for {asset_to_plot}..."):
+            oos_results, selection_history = cached_walk_forward(
+                y[asset_to_plot], 
+                X, 
+                min_train_months=240, 
+                horizon_months=horizon_months, 
+                rebalance_freq=12,
+                asset_class=asset_to_plot
+            )
         
-        st.markdown('<div class="panel-header">SHORT-RUN DYNAMICS (MACRO Γ COEFFICIENTS)</div>', unsafe_allow_html=True)
-        st.plotly_chart(plot_coef_heatmap(gamma), width="stretch", config={'displayModeBar': False})
-        
-        # We removed the generic equation list in favor of the asset specific ones above
-    
+        if not oos_results.empty:
+            # Align actual returns with OOS predictions
+            actual_oos = y[asset_to_plot].loc[oos_results.index]
+            
+            # Plot
+            fig_backtest = plot_backtest(
+                actual_returns=actual_oos, 
+                predicted_returns=oos_results['predicted_return'], 
+                confidence_lower=oos_results['lower_ci'], 
+                confidence_upper=oos_results['upper_ci'],
+                confidence_level=confidence_level
+            )
+            
+            # Visual Cue: Update line style for OOS Prediction
+            for trace in fig_backtest.data:
+                if trace.name == 'Predicted':
+                    trace.name = 'OOS Prediction (Walk-Forward)'
+                    trace.line.color = '#4da6ff'
+            
+            st.plotly_chart(fig_backtest, width='stretch')
+            
+            # Stats
+            corr = actual_oos.corr(oos_results['predicted_return'])
+            rmse = np.sqrt(((actual_oos - oos_results['predicted_return'])**2).mean())
+            st.markdown(f"**OOS Correlation:** {corr:.2f} | **OOS RMSE:** {rmse:.2%}")
+        else:
+            st.warning("Insufficient data for Walk-Forward Backtest.")
+
     with tab5:
-        st.markdown("""
-        <div style="font-family: 'IBM Plex Mono'; font-size: 0.85rem; color: #888; line-height: 1.8;">
-        """, unsafe_allow_html=True)
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.markdown("**Regime Indicators**")
+            st.dataframe(pd.DataFrame([{'Indicator': k, 'Value': v} for k,v in stress_indicators.items()]), hide_index=True)
+        with col_d2:
+            st.markdown("**Best-in-Class Models**")
+            model_info = {
+                'EQUITY': 'Random Forest Regressor (Non-Linear Ensemble)',
+                'BONDS': 'ElasticNetCV (L1/L2 Regularized Linear)',
+                'GOLD': 'Simple OLS (Ordinary Least Squares)'
+            }
+            for asset in ['EQUITY', 'BONDS', 'GOLD']:
+                m_type = model_info.get(asset, "Unknown")
+                n_feats = len(stability_results_map[asset]['stable_features'])
+                st.markdown(f"**{asset}**")
+                st.markdown(f"- Architecture: `{m_type}`")
+                st.markdown(f"- Features: `{n_feats}` macro drivers utilized")
         
-        steps = [
-            ("Step 1", "INGESTION & PREPROCESSING", "FRED-MD data loaded, transformation codes applied. Dataset separated into levels (yₜ) and variations (Δyₜ).", "positive"),
-            ("Step 2", "BREAK DETECTION & WEIGHTING", f"Temporal weights computed (λ={decay}). Sentinel status: {status}.", "positive" if status == "CALM" else "warning" if status == "WARNING" else "negative"),
-            ("Step 3", "COINTEGRATION RANK", f"Weighted Johansen test performed. Rank r={coint_results['rank']} identified. β vectors estimated.", "positive"),
-            ("Step 4", "ELASTIC NET ESTIMATION", f"Adaptive Elastic Net (α={alpha}, L1/L2={l1_ratio}) applied. Γ matrix estimated with {active_vars} active coefficients.", "positive"),
-            ("Step 5", "ECT EXTRACTION", f"Error Correction Term computed: ECTₜ = β'yₜ₋₁. Current deviation: {ect_current:+.3f}.", "positive" if abs(ect_current) < 1 else "warning"),
-            ("Step 6", "SIGNAL GENERATION", f"Target weights: EQUITY={signals['weights']['EQUITY']:.1%}, BONDS={signals['weights']['BONDS']:.1%}, GOLD={signals['weights']['GOLD']:.1%}. Rebalance: {'EMERGENCY' if signals['rebalance_trigger'] else 'QUARTERLY'}.", "positive" if not signals['rebalance_trigger'] else "negative")
-        ]
+        st.divider()
+        st.markdown("**Feature Selection Persistence**")
+        asset_heatmap = st.selectbox("Select Asset for Heatmap", ['EQUITY', 'BONDS', 'GOLD'], key='heatmap_asset')
         
-        for step_id, title, desc, status_class in steps:
-            st.markdown(f"""
-            <div style="display: flex; margin-bottom: 1rem; padding: 0.75rem; background: #111; border: 1px solid #2a2a2a; border-radius: 2px;">
-                <div style="min-width: 60px; color: #ff6b35; font-weight: 600;">{step_id}</div>
-                <div style="flex: 1;">
-                    <div style="color: #e8e8e8; font-weight: 500; margin-bottom: 0.25rem;">{title}</div>
-                    <div style="color: #888; font-size: 0.8rem;">{desc}</div>
-                </div>
-                <div style="min-width: 20px; text-align: right;">
-                    <span style="color: {'#00d26a' if status_class == 'positive' else '#ff6b35' if status_class == 'warning' else '#ff4757'};">●</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-        
-        # Order generation
-        st.markdown('<div class="panel-header">GENERATED ORDERS</div>', unsafe_allow_html=True)
-        
-        # Simulate current vs target
-        current_weights = {'EQUITY': 0.55, 'BONDS': 0.35, 'GOLD': 0.10}
-        
-        orders_data = []
-        for asset in ['EQUITY', 'BONDS', 'GOLD']:
-            current = current_weights[asset]
-            target = signals['weights'][asset]
-            diff = target - current
-            action = 'BUY' if diff > 0.01 else 'SELL' if diff < -0.01 else 'HOLD'
-            orders_data.append({
-                'Asset': asset,
-                'Current': f"{current:.1%}",
-                'Target': f"{target:.1%}",
-                'Delta': f"{diff:+.1%}",
-                'Action': action
-            })
-        
-        orders_df = pd.DataFrame(orders_data)
-        st.dataframe(orders_df, hide_index=True, width='stretch')
-
-    with tab6:
-        st.markdown('<div class="panel-header">MACRO INDICATORS DATA (FRED-MD)</div>', unsafe_allow_html=True)
-        st.dataframe(
-            macro_data,
-            width="stretch",
-            height=400
-        )
-        
-        st.markdown('<div class="panel-header">ASSET DATA (YFINANCE)</div>', unsafe_allow_html=True)
-        
-        col_assets_left, col_assets_right = st.columns(2)
-        
-        with col_assets_left:
-            st.markdown('<div style="font-family: \'IBM Plex Mono\'; font-size: 0.8rem; color: #888; margin-bottom: 0.5rem;">HISTORICAL PRICES (FULL TRAINING SET)</div>', unsafe_allow_html=True)
-            st.dataframe(
-                asset_prices,
-                width="stretch",
-                height=300
+        with st.spinner(f"Loading selection history for {asset_heatmap}..."):
+            _, selection_df = cached_walk_forward(
+                y[asset_heatmap], 
+                X, 
+                min_train_months=240, 
+                horizon_months=horizon_months, 
+                rebalance_freq=12,
+                asset_class=asset_heatmap
             )
             
-        with col_assets_right:
-            st.markdown('<div style="font-family: \'IBM Plex Mono\'; font-size: 0.8rem; color: #888; margin-bottom: 0.5rem;">LOG RETURNS (FULL TRAINING SET)</div>', unsafe_allow_html=True)
-            st.dataframe(
-                asset_returns,
-                width="stretch",
-                height=300
-            )
+        if not selection_df.empty:
+            st.plotly_chart(plot_feature_heatmap(selection_df, descriptions), width='stretch')
+        else:
+            st.info("No selection history available for this asset.")
         
-        st.markdown('<div class="panel-header">KERNEL FEATURES (TRANSFORMED)</div>', unsafe_allow_html=True)
-        st.dataframe(
-            kernel_features,
-            width="stretch",
-            height=400
-        )
-
-    with tab7:
-        try:
-            with open('specs.md', 'r') as f:
-                specs_content = f.read()
-            st.markdown(specs_content, unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"Error loading specs.md: {e}")
-    
-    # Footer
-    st.markdown("""
-    <div style="margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #2a2a2a; text-align: center;">
-        <span style="font-family: 'IBM Plex Mono'; font-size: 0.65rem; color: #555; letter-spacing: 1px;">
-            VECM STRATEGIC ALLOCATION SYSTEM · HORIZON 5-10Y · QUARTERLY REBALANCING · PRESERVATION FIRST
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
+        if st.button("Export Results Summary"):
+            summary_df = pd.DataFrame(summary_data)
+            st.download_button("Download CSV", summary_df.to_csv(index=False), "expected_returns.csv", "text/csv")
 
 
 if __name__ == "__main__":
