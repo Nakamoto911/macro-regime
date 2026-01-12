@@ -1974,7 +1974,7 @@ def main():
     with m4:
         st.metric("Horizon", f"{horizon_months}m")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "SERIES", "BACKTEST", "DIAGNOSTICS"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "SERIES", "BACKTEST", "DIAGNOSTICS", "README"])
     
     with tab1:
         st.markdown(f'<div class="panel-header">EXPECTED {horizon_months}M RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
@@ -2380,6 +2380,15 @@ def main():
         if st.button("Export Results Summary"):
             summary_df = pd.DataFrame(summary_data)
             st.download_button("Download CSV", summary_df.to_csv(index=False), "expected_returns.csv", "text/csv")
+
+    with tab6:
+        st.markdown('<div class="panel-header">SYSTEM SPECIFICATIONS & DOCUMENTATION</div>', unsafe_allow_html=True)
+        try:
+            with open("specs.md", "r") as f:
+                readme_content = f.read()
+            st.markdown(readme_content)
+        except Exception as e:
+            st.error(f"Error loading specs.md: {e}")
 
 
 if __name__ == "__main__":
