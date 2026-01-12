@@ -1,5 +1,5 @@
 """
-VECM Strategic Asset Allocation System - V3
+Macro-Driven Strategic Asset Allocation System - V3
 Forward Return Prediction Model (12-Month Horizon)
 
 Target: US Equities / Bonds / Gold
@@ -1728,7 +1728,7 @@ def generate_narrative(expected_returns: dict,
 
 def main():
     st.set_page_config(
-        page_title="VECM Strategic Allocation",
+        page_title="Macro-Driven Strategic Asset Allocation System",
         page_icon="◈",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -1924,7 +1924,7 @@ def main():
 
     st.markdown(f"""
     <div class="header-container">
-        <p class="header-title">◈ VECM STRATEGIC ALLOCATION</p>
+        <p class="header-title">◈ MACRO-DRIVEN STRATEGIC ASSET ALLOCATION SYSTEM</p>
         <p class="header-subtitle">FORWARD RETURN PREDICTION · {horizon_months}-MONTH HORIZON</p>
     </div>
     """, unsafe_allow_html=True)
