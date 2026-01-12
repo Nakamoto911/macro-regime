@@ -1438,9 +1438,18 @@ def run_collective_analysis(y, X, l1_ratio, min_persistence, estimation_window_y
         # Final Asset-Specific Estimation
         y_valid = y_asset.dropna()
         X_valid = X.loc[y_valid.index]
+        
+        # RESTRICT TO STABLE FEATURES ONLY
+        if stable_features:
+            X_valid = X_valid[stable_features]
+            X_current = X.tail(1)[stable_features]
+        else:
+            # Fallback to all if somehow empty (though selection logic avoids this)
+            X_current = X.tail(1)
+
         win = Winsorizer(threshold=3.0)
         X_valid_clean = win.fit_transform(X_valid)
-        X_current_clean = win.transform(X.tail(1))
+        X_current_clean = win.transform(X_current)
         
         if asset == 'EQUITY':
             model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42)
@@ -1449,12 +1458,12 @@ def run_collective_analysis(y, X, l1_ratio, min_persistence, estimation_window_y
             prediction_se = np.std(y_valid - model.predict(X_valid_clean))
             hac_results = {
                 'model': model,
-                'coefficients': pd.Series(0, index=X.columns.tolist() + ['const']),
+                'coefficients': pd.Series(0, index=X_valid.columns.tolist() + ['const']),
                 'intercept': 0,
-                'importance': pd.Series(model.feature_importances_, index=X.columns)
+                'importance': pd.Series(model.feature_importances_, index=X_valid.columns)
             }
             beta = hac_results['importance']
-            selected_features = X.columns.tolist()
+            selected_features = X_valid.columns.tolist()
         elif asset == 'BONDS':
             model = ElasticNetCV(l1_ratio=[.1, .5, .7, .9, .95, .99, 1], cv=5, max_iter=5000)
             model.fit(X_valid_clean, y_valid)
@@ -1462,10 +1471,10 @@ def run_collective_analysis(y, X, l1_ratio, min_persistence, estimation_window_y
             prediction_se = np.std(y_valid - model.predict(X_valid_clean))
             hac_results = {
                 'model': model,
-                'coefficients': pd.Series(model.coef_, index=X.columns),
+                'coefficients': pd.Series(model.coef_, index=X_valid.columns),
                 'intercept': model.intercept_
             }
-            beta = pd.Series(model.coef_, index=X.columns)
+            beta = pd.Series(model.coef_, index=X_valid.columns)
             selected_features = beta[beta != 0].index.tolist()
         else: # GOLD
             model = LinearRegression()
@@ -1474,10 +1483,10 @@ def run_collective_analysis(y, X, l1_ratio, min_persistence, estimation_window_y
             prediction_se = np.std(y_valid - model.predict(X_valid_clean))
             hac_results = {
                 'model': model,
-                'coefficients': pd.Series(model.coef_, index=X.columns),
+                'coefficients': pd.Series(model.coef_, index=X_valid.columns),
                 'intercept': model.intercept_
             }
-            beta = pd.Series(model.coef_, index=X.columns)
+            beta = pd.Series(model.coef_, index=X_valid.columns)
             selected_features = beta[beta != 0].index.tolist()
 
         # CI calculation
