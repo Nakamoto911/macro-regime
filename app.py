@@ -23,6 +23,7 @@ from scipy.stats import t
 import pandas_datareader.data as web
 import warnings
 warnings.filterwarnings('ignore')
+from backtester import StrategyBacktester
 
 # NBER Recession Dates (approximate for FRED-MD plotting)
 NBER_RECESSIONS = [
@@ -707,6 +708,67 @@ def evaluate_regime(macro_data: pd.DataFrame, alert_threshold: float = 2.0) -> t
         status = "CALM"
         
     return status, stress_score, indicators
+
+
+def get_aggregated_predictions(y, X, horizon_months=12):
+    """
+    Call cached_walk_forward for EQUITY, BONDS, GOLD and merge results with progress feedback.
+    """
+    results_preds = {}
+    results_lower = {}
+    
+    assets = ['EQUITY', 'BONDS', 'GOLD']
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    for i, asset in enumerate(assets):
+        status_text.markdown(f"**Step {i+1}/3:** Generating OOS Predictions for `{asset}`...")
+        progress_bar.progress((i) / len(assets))
+        
+        oos_results, _ = cached_walk_forward(
+            y[asset], 
+            X, 
+            min_train_months=240, 
+            horizon_months=horizon_months, 
+            rebalance_freq=12,
+            asset_class=asset
+        )
+        results_preds[asset] = oos_results['predicted_return']
+        results_lower[asset] = oos_results['lower_ci']
+        
+    progress_bar.progress(1.0)
+    status_text.empty()
+    progress_bar.empty()
+    
+    preds_df = pd.DataFrame(results_preds)
+    lower_ci_df = pd.DataFrame(results_lower)
+    return preds_df, lower_ci_df
+
+
+def get_historical_stress(macro_data):
+    """
+    Calculate historical Stress Score based on rolling 60m Z-scores.
+    """
+    history = pd.DataFrame(index=macro_data.index)
+    
+    # 1. Calculate BAA_AAA spread Z-Score (rolling 60m)
+    if 'BAA_AAA' in macro_data.columns:
+        rolled_mean = macro_data['BAA_AAA'].rolling(window=60).mean()
+        rolled_std = macro_data['BAA_AAA'].rolling(window=60).std()
+        history['credit'] = (macro_data['BAA_AAA'] - rolled_mean) / rolled_std
+    else:
+        history['credit'] = 0
+        
+    # 2. Calculate Yield Curve (10Y-FedFunds) Z-Score (rolling 60m)
+    if 'SPREAD' in macro_data.columns:
+        rolled_mean = macro_data['SPREAD'].rolling(window=60).mean()
+        rolled_std = macro_data['SPREAD'].rolling(window=60).std()
+        history['curve'] = -(macro_data['SPREAD'] - rolled_mean) / rolled_std
+    else:
+        history['curve'] = 0
+        
+    stress_score = 0.5 * history['credit'].fillna(0) + 0.5 * history['curve'].fillna(0)
+    return stress_score
 
 
 def compute_allocation(expected_returns: dict,
@@ -1408,7 +1470,7 @@ def plot_variable_survival(stability_results_map: dict, asset: str, descriptions
     return fig
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Synchronizing Macro Models...")
 def run_collective_analysis(y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months):
     """
     Runs the full analysis for all assets in one go and caches the results.
@@ -1952,10 +2014,9 @@ def main():
     y = y_forward.loc[valid_idx]
     
     # 2. Main Analysis Loop (Synchronized & Cached)
-    with st.spinner("Synchronizing Macro Models..."):
-        expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats = run_collective_analysis(
-            y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months
-        )
+    expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats = run_collective_analysis(
+        y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months
+    )
             
     # 3. Regime and Allocation
     regime_status, stress_score, stress_indicators = evaluate_regime(macro_data, alert_threshold=alert_threshold)
@@ -1974,8 +2035,9 @@ def main():
     with m4:
         st.metric("Horizon", f"{horizon_months}m")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["ALLOCATION", "STABLE DRIVERS", "SERIES", "BACKTEST", "DIAGNOSTICS", "README"])
-    
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "ALLOCATION", "STABLE DRIVERS", "SERIES", "BACKTEST", "DIAGNOSTIC", "STRATEGY LAB", "README"
+    ])
     with tab1:
         st.markdown(f'<div class="panel-header">EXPECTED {horizon_months}M RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
         
@@ -2342,44 +2404,47 @@ def main():
         }
         st.info(f"Target Architecture: **{model_display_names.get(asset_to_plot)}** | Training Window: **240 Months**")
         
-        # Run Walk-Forward Backtest (Cached)
-        with st.spinner(f"Running Walk-Forward Backtest for {asset_to_plot}..."):
-            oos_results, selection_history = cached_walk_forward(
-                y[asset_to_plot], 
-                X, 
-                min_train_months=240, 
-                horizon_months=horizon_months, 
-                rebalance_freq=12,
-                asset_class=asset_to_plot
-            )
-        
-        if not oos_results.empty:
-            # Align actual returns with OOS predictions
-            actual_oos = y[asset_to_plot].loc[oos_results.index]
+        # Run Walk-Forward Backtest (Lazy Load)
+        if st.button(f"🔍 RUN BACKTEST FOR {asset_to_plot}", width='stretch'):
+            with st.spinner(f"Running Walk-Forward Backtest for {asset_to_plot}..."):
+                oos_results, selection_history = cached_walk_forward(
+                    y[asset_to_plot], 
+                    X, 
+                    min_train_months=240, 
+                    horizon_months=horizon_months, 
+                    rebalance_freq=12,
+                    asset_class=asset_to_plot
+                )
             
-            # Plot
-            fig_backtest = plot_backtest(
-                actual_returns=actual_oos, 
-                predicted_returns=oos_results['predicted_return'], 
-                confidence_lower=oos_results['lower_ci'], 
-                confidence_upper=oos_results['upper_ci'],
-                confidence_level=confidence_level
-            )
-            
-            # Visual Cue: Update line style for OOS Prediction
-            for trace in fig_backtest.data:
-                if trace.name == 'Predicted':
-                    trace.name = 'OOS Prediction (Walk-Forward)'
-                    trace.line.color = '#4da6ff'
-            
-            st.plotly_chart(fig_backtest, width='stretch')
-            
-            # Stats
-            corr = actual_oos.corr(oos_results['predicted_return'])
-            rmse = np.sqrt(((actual_oos - oos_results['predicted_return'])**2).mean())
-            st.markdown(f"**OOS Correlation:** {corr:.2f} | **OOS RMSE:** {rmse:.2%}")
+            if not oos_results.empty:
+                # Align actual returns with OOS predictions
+                actual_oos = y[asset_to_plot].loc[oos_results.index]
+                
+                # Plot
+                fig_backtest = plot_backtest(
+                    actual_returns=actual_oos, 
+                    predicted_returns=oos_results['predicted_return'], 
+                    confidence_lower=oos_results['lower_ci'], 
+                    confidence_upper=oos_results['upper_ci'],
+                    confidence_level=confidence_level
+                )
+                
+                # Visual Cue: Update line style for OOS Prediction
+                for trace in fig_backtest.data:
+                    if trace.name == 'Predicted':
+                        trace.name = 'OOS Prediction (Walk-Forward)'
+                        trace.line.color = '#4da6ff'
+                
+                st.plotly_chart(fig_backtest, width='stretch')
+                
+                # Stats
+                corr = actual_oos.corr(oos_results['predicted_return'])
+                rmse = np.sqrt(((actual_oos - oos_results['predicted_return'])**2).mean())
+                st.markdown(f"**OOS Correlation:** {corr:.2f} | **OOS RMSE:** {rmse:.2%}")
+            else:
+                st.warning("Insufficient data for Walk-Forward Backtest.")
         else:
-            st.warning("Insufficient data for Walk-Forward Backtest.")
+            st.info(f"Click the button above to run the 20-year walk-forward backtest for {asset_to_plot}.")
 
     with tab5:
         col_d1, col_d2 = st.columns(2)
@@ -2405,35 +2470,295 @@ def main():
         
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
             with st.expander(f"Diagnostics for {asset}", expanded=(asset == 'EQUITY')):
-                with st.spinner(f"Loading diagnostics for {asset}..."):
-                    _, selection_df = cached_walk_forward(
-                        y[asset], 
-                        X, 
-                        min_train_months=240, 
-                        horizon_months=horizon_months, 
-                        rebalance_freq=12,
-                        asset_class=asset
-                    )
-                    
-                if not selection_df.empty:
-                    st.markdown("### Feature Selection Persistence")
-                    st.plotly_chart(plot_feature_heatmap(selection_df, descriptions), width='stretch', key=f"heatmap_{asset}")
-                    
-                    st.divider()
-                    st.markdown("### Stability Analysis")
-                    # Stability Boxplot
-                    st.plotly_chart(plot_stability_boxplot(stability_results_map, asset, descriptions), width='stretch', key=f"boxplot_{asset}")
-
-                    # Variable Survival Leaderboard
-                    st.plotly_chart(plot_variable_survival(stability_results_map, asset, descriptions), width='stretch', key=f"survival_{asset}")
+                if st.button(f"📊 LOAD {asset} DIAGNOSTICS", key=f"btn_diag_{asset}"):
+                    with st.spinner(f"Loading diagnostics for {asset}..."):
+                        _, selection_df = cached_walk_forward(
+                            y[asset], 
+                            X, 
+                            min_train_months=240, 
+                            horizon_months=horizon_months, 
+                            rebalance_freq=12,
+                            asset_class=asset
+                        )
+                        
+                    if not selection_df.empty:
+                        st.markdown("### Feature Selection Persistence")
+                        st.plotly_chart(plot_feature_heatmap(selection_df, descriptions), width='stretch', key=f"heatmap_{asset}")
+                        
+                        st.divider()
+                        st.markdown("### Stability Analysis")
+                        # Stability Boxplot
+                        st.plotly_chart(plot_stability_boxplot(stability_results_map, asset, descriptions), width='stretch', key=f"boxplot_{asset}")
+    
+                        # Variable Survival Leaderboard
+                        st.plotly_chart(plot_variable_survival(stability_results_map, asset, descriptions), width='stretch', key=f"survival_{asset}")
+                    else:
+                        st.info(f"No diagnostic data available for {asset}.")
                 else:
-                    st.info(f"No diagnostic data available for {asset}.")
+                    st.info(f"Click the button to load stability and persistence diagnostics for {asset}.")
         
         if st.button("Export Results Summary"):
             summary_df = pd.DataFrame(summary_data)
             st.download_button("Download CSV", summary_df.to_csv(index=False), "expected_returns.csv", "text/csv")
 
     with tab6:
+        st.markdown('<div class="panel-header">STRATEGY LAB: MACRO-DRIVEN BACKTESTER</div>', unsafe_allow_html=True)
+        
+        # Zone A: Configuration
+        strategy_type = st.radio("Select Strategy", ["Max Return", "Min Volatility", "Min Drawdown", "Min Loss"], horizontal=True)
+
+        with st.expander("📖 Detailed Strategy Methodologies (Click to expand)", expanded=False):
+            st.markdown("""
+            ### 🚀 Max Return (Tactical Momentum)
+            *   **Core Logic**: This strategy identifies the top-performing assets based on predicted returns.
+            *   **Decision**: It selects up to the **'Top N Assets'** that have a predicted return higher than the **Risk-Free Rate**.
+            *   **Allocation**: 
+                *   **Equal**: Splits the **'Max Asset Weight'** evenly across all selected Top-N assets.
+                *   **Proportional**: Splits the **'Max Asset Weight'** based on the relative strength of their predicted returns.
+            *   **Goal**: Maximize returns through momentum while allowing for diversification across the strongest forecasted assets.
+
+            ### 📉 Min Volatility (Quantitative Optimization)
+            *   **Core Logic**: Uses **Global Minimum Variance (GMV)** optimization. It ignores return predictions and focuses entirely on the co-movement and risk of assets.
+            *   **Decision**: It utilizes a **Rolling Covariance Matrix** (based on your 'Covariance Lookback') to calculate the weights that minimize the combined portfolio variance.
+            *   **Allocation**: Solver-based weights (summing to 100%) constrained between 0% and 100%. 
+            *   **Goal**: Create the smoothest possible equity curve by exploiting diversification and avoiding volatile assets.
+
+            ### 🛡️ Min Drawdown (Regime-Aware Defense)
+            *   **Core Logic**: A hybrid approach that switches behavior based on the **Macro Stress Score** (Aggregate Z-Score of instability indicators).
+            *   **Decision**: 
+                *   **Normal Mode**: Active when Stress Score < 'Alert Threshold'. It defaults to a balanced **60/30/10** allocation.
+                *   **Defensive Mode**: Triggered when Stress Score > 'Alert Threshold'. It enforces a strict **'Defensive Equity Cap'** (e.g., max 10% stocks) and moves the rest into Bonds and a specified **'Cash Floor'**.
+            *   **Goal**: Protect capital during major market crashes and systemic instabilities.
+
+            ### 💎 Min Loss (Safety-First Confidence)
+            *   **Core Logic**: Uses the **Lower 95% Confidence Interval** of the predictions. This strategy requires 'high conviction'.
+            *   **Decision**: Instead of looking at what *might* happen (Mean), it looks at the *worst-case* (Lower CI). It only invests in an asset if its **Lower CI is > 0**.
+            *   **Allocation**: If multiple assets satisfy the condition, it picks the one with the highest Lower CI. If no asset qualifies, it moves **100% to Cash**.
+            *   **Goal**: Minimize the probability of negative returns by only taking bets when the model is statistically very confident in a positive outcome.
+            """)
+
+        with st.form("backtest_config_form"):
+            st.markdown("**1. Passive Benchmark Configuration**")
+            bc1, bc2, bc3 = st.columns(3)
+            bw_eq = bc1.slider("Benchmark: Equity %", 0, 100, 60, key="bench_eq")
+            bw_bond = bc2.slider("Benchmark: Bonds %", 0, 100, 30, key="bench_bond")
+            bw_gold = bc3.slider("Benchmark: Gold %", 0, 100, 10, key="bench_gold")
+            
+            st.divider()
+            st.markdown("**2. Simulation Window**")
+            # Calculate available OOS range (approximate starting point)
+            all_dates = asset_prices.index
+            min_train = 240
+            if len(all_dates) > min_train:
+                oos_start_date = all_dates[min_train]
+                oos_end_date = all_dates[-1]
+                
+                # Create a date range selector
+                start_str = oos_start_date.strftime('%Y-%m')
+                end_str = oos_end_date.strftime('%Y-%m')
+                
+                selected_range = st.select_slider(
+                    "Select Simulation Period",
+                    options=[d.strftime('%Y-%m') for d in all_dates[min_train:]],
+                    value=(start_str, end_str)
+                )
+                sim_start, sim_end = selected_range
+            else:
+                st.warning("Insufficient data for simulation window selection.")
+                sim_start, sim_end = None, None
+
+            st.divider()
+            st.markdown(f"**3. {strategy_type} Parameters**")
+            col_lab1, col_lab2 = st.columns(2)
+            with col_lab1:
+                initial_capital = st.number_input("Initial Capital ($)", value=10000, step=1000)
+                trading_cost = st.slider("Trading Cost (bps)", 0, 50, 10)
+            with col_lab2:
+                rebalance_freq = st.selectbox("Rebalance Frequency", [1, 3, 12], format_func=lambda x: f"Every {x} Month(s)")
+            
+            # Dynamic Parameters (Rendered inside form)
+            params = {}
+            if strategy_type == "Min Drawdown":
+                st.divider()
+                sc1, sc2, sc3 = st.columns(3)
+                params['alert_threshold'] = sc1.slider("Alert Threshold", 1.0, 3.0, 2.0)
+                params['defensive_equity_cap'] = sc2.slider("Defensive Equity Cap", 0.0, 0.4, 0.2)
+                params['defensive_cash_floor'] = sc3.slider("Defensive Cash Floor", 0.3, 0.8, 0.5)
+            elif strategy_type == "Max Return":
+                st.divider()
+                mc1, mc2, mc3 = st.columns(3)
+                params['max_weight'] = mc1.slider("Max Combined Weight", 0.5, 1.0, 0.8)
+                params['top_n'] = mc2.slider("Top N Assets", 1, 3, 1)
+                params['weighting_scheme'] = mc3.selectbox("Weighting Scheme", ["Equal", "Proportional"])
+                params['risk_free_rate'] = risk_free_rate
+            elif strategy_type == "Min Volatility":
+                st.divider()
+                params['cov_lookback'] = st.slider("Covariance Lookback (Months)", 24, 120, 60)
+            
+            st.divider()
+            submitted = st.form_submit_button("🚀 RUN STRATEGY SIMULATION", width='stretch', type="primary")
+
+        # Run Backtest
+        if submitted:
+            # Package all parameters
+            full_params = {
+                'initial_capital': initial_capital,
+                'trading_cost_bps': trading_cost,
+                'rebalance_freq': rebalance_freq,
+                'risk_free_rate': risk_free_rate,
+                **params
+            }
+            
+            b_total_w = bw_eq + bw_bond + bw_gold
+            benchmark_weights = {
+                'EQUITY': bw_eq / b_total_w if b_total_w > 0 else 0,
+                'BONDS': bw_bond / b_total_w if b_total_w > 0 else 0,
+                'GOLD': bw_gold / b_total_w if b_total_w > 0 else 0
+            }
+
+            with st.spinner("Initializing strategy engine..."):
+                # Prepare inputs
+                preds_df, lower_ci_df = get_aggregated_predictions(y, X, horizon_months=horizon_months)
+                hist_stress = get_historical_stress(macro_data)
+                
+                # Filter by selected date range
+                if sim_start and sim_end:
+                    preds_df = preds_df.loc[sim_start:sim_end]
+                    lower_ci_df = lower_ci_df.loc[sim_start:sim_end]
+                    hist_stress = hist_stress.loc[sim_start:sim_end]
+                    
+                # Initialize Backtester
+                lab_bt = StrategyBacktester(asset_prices, preds_df, lower_ci_df, hist_stress)
+                
+                # Run
+                lab_results = lab_bt.run_strategy(strategy_type, **full_params)
+                benchmark_results = lab_bt.run_strategy("Buy & Hold", weights_dict=benchmark_weights, initial_capital=initial_capital, trading_cost_bps=trading_cost, rebalance_freq=rebalance_freq)
+                
+                # Store in session state to persist after rerun (if any widgets change)
+                st.session_state.lab_results = lab_results
+                st.session_state.benchmark_results = benchmark_results
+                st.session_state.lab_stress = hist_stress
+                st.session_state.lab_freq = rebalance_freq
+
+        if "lab_results" in st.session_state:
+            lab_results = st.session_state.lab_results
+            benchmark_results = st.session_state.benchmark_results
+            hist_stress = st.session_state.lab_stress
+
+            # Zone B: Visualization (Unified Stacked Chart)
+            
+            fig_lab = make_subplots(
+                rows=3, cols=1, 
+                shared_xaxes=True, 
+                vertical_spacing=0.02,
+                row_heights=[0.35, 0.45, 0.2],
+                specs=[[{"secondary_y": True}], [{}], [{}]]
+            )
+
+            # 1. Asset Allocation (Row 1)
+            weights_df = lab_results['weights']
+            colors_map = {'EQUITY': '#ff6b35', 'BONDS': '#4da6ff', 'GOLD': '#ffd700', 'CASH': '#444'}
+            for asset in ['EQUITY', 'BONDS', 'GOLD', 'CASH']:
+                fig_lab.add_trace(go.Scatter(
+                    x=weights_df.index, y=weights_df[asset],
+                    name=asset, stackgroup='one',
+                    line=dict(color=colors_map[asset], width=0.5),
+                    fillcolor=colors_map[asset].replace('0.5', '0.3'),
+                    legendgroup='assets'
+                ), row=1, col=1)
+            
+            # Overlay Stress Score (Secondary Y in Row 1)
+            fig_lab.add_trace(go.Scatter(
+                x=hist_stress.index, y=hist_stress.values / hist_stress.max() if hist_stress.max() > 0 else hist_stress,
+                name='Stress Score (Norm)', line=dict(color='rgba(255,255,255,0.2)', dash='dot'),
+                legendgroup='regime'
+            ), row=1, col=1, secondary_y=True)
+
+            # 2. Cumulative Returns (Row 2)
+            fig_lab.add_trace(go.Scatter(
+                x=lab_results['equity_curve'].index, y=lab_results['equity_curve'].values, 
+                name='Strategy NAV', line=dict(color='#ff6b35', width=2),
+                legendgroup='nav'
+            ), row=2, col=1)
+            fig_lab.add_trace(go.Scatter(
+                x=benchmark_results['equity_curve'].index, y=benchmark_results['equity_curve'].values, 
+                name='Benchmark NAV', line=dict(color='#888', dash='dash'),
+                legendgroup='nav'
+            ), row=2, col=1)
+
+            # 3. Drawdown Profile (Row 3)
+            def get_drawdown(curve):
+                return (curve / curve.expanding().max()) - 1
+            
+            fig_lab.add_trace(go.Scatter(
+                x=lab_results['equity_curve'].index, y=get_drawdown(lab_results['equity_curve']), 
+                name='Strategy DD', fill='tozeroy', line=dict(color='#ff4757'),
+                legendgroup='dd'
+            ), row=3, col=1)
+            fig_lab.add_trace(go.Scatter(
+                x=benchmark_results['equity_curve'].index, y=get_drawdown(benchmark_results['equity_curve']), 
+                name='Benchmark DD', line=dict(color='#888'),
+                legendgroup='dd'
+            ), row=3, col=1)
+
+            # Layout Updates
+            use_log = st.checkbox("Log Scale (NAV Chart)", key="lab_log_scale")
+            theme = create_theme()
+            
+            layout_args = {
+                'height': 800,
+                'showlegend': True,
+                'legend': dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+                'margin': dict(l=50, r=50, t=60, b=50),
+                'hovermode': 'x unified',
+                'paper_bgcolor': theme['paper_bgcolor'],
+                'plot_bgcolor': theme['plot_bgcolor']
+            }
+            fig_lab.update_layout(**layout_args)
+            
+            # Row 1 Styling (Allocation)
+            fig_lab.update_yaxes(title_text="Allocation", range=[0, 1], tickformat='.0%', row=1, col=1, gridcolor='#1a1a1a')
+            fig_lab.update_yaxes(range=[0, 1.2], showgrid=False, showticklabels=False, row=1, col=1, secondary_y=True)
+            
+            # Row 2 Styling (Performance)
+            fig_lab.update_yaxes(title_text="NAV ($)", type="log" if use_log else "linear", row=2, col=1, gridcolor='#1a1a1a')
+            
+            # Row 3 Styling (Drawdown)
+            fig_lab.update_yaxes(title_text="Drawdown", tickformat='.0%', row=3, col=1, gridcolor='#1a1a1a')
+            
+            # Global X-Axis Styling
+            fig_lab.update_xaxes(**theme['xaxis'], row=1, col=1)
+            fig_lab.update_xaxes(**theme['xaxis'], row=2, col=1)
+            fig_lab.update_xaxes(**theme['xaxis'], row=3, col=1)
+
+            st.plotly_chart(fig_lab, width='stretch')
+
+            # Zone C: Metrics Table
+            st.divider()
+            st.markdown("**Performance Metrics Summary**")
+            
+            # Extract common metrics
+            metrics_comp = pd.DataFrame({
+                'Strategy': lab_results['metrics'],
+                'Benchmark': benchmark_results['metrics']
+            }).T
+            
+            # Formatting
+            metrics_comp['CAGR'] = metrics_comp['CAGR'].apply(lambda x: f"{x:.2%}")
+            metrics_comp['Volatility'] = metrics_comp['Volatility'].apply(lambda x: f"{x:.2%}")
+            metrics_comp['Sharpe'] = metrics_comp['Sharpe'].apply(lambda x: f"{x:.2f}")
+            metrics_comp['Sortino'] = metrics_comp['Sortino'].apply(lambda x: f"{x:.2f}")
+            metrics_comp['Max Drawdown'] = metrics_comp['Max Drawdown'].apply(lambda x: f"{x:.2%}")
+            metrics_comp['Calmar'] = metrics_comp['Calmar'].apply(lambda x: f"{x:.2f}")
+            metrics_comp['Turnover'] = metrics_comp['Turnover'].apply(lambda x: f"{x:.2f}x")
+            
+            metrics_comp['Rebalancing Cost'] = metrics_comp['Rebalancing Cost'].apply(lambda x: f"${x:,.0f}")
+            
+            st.table(metrics_comp)
+        else:
+            st.info("💡 Select a strategy and click the button above to start the out-of-sample simulation. The process may take up to 60 seconds on the first run.")
+
+    with tab7:
         st.markdown('<div class="panel-header">SYSTEM SPECIFICATIONS & DOCUMENTATION</div>', unsafe_allow_html=True)
         try:
             with open("specs.md", "r") as f:
