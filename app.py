@@ -2544,8 +2544,8 @@ def main():
             st.markdown("**1. Passive Benchmark Configuration**")
             bc1, bc2, bc3 = st.columns(3)
             bw_eq = bc1.slider("Benchmark: Equity %", 0, 100, 60, key="bench_eq")
-            bw_bond = bc2.slider("Benchmark: Bonds %", 0, 100, 30, key="bench_bond")
-            bw_gold = bc3.slider("Benchmark: Gold %", 0, 100, 10, key="bench_gold")
+            bw_bond = bc2.slider("Benchmark: Bonds %", 0, 100, 40, key="bench_bond")
+            bw_gold = bc3.slider("Benchmark: Gold %", 0, 100, 0, key="bench_gold")
             
             st.divider()
             st.markdown("**2. Simulation Window**")
@@ -2560,10 +2560,14 @@ def main():
                 start_str = oos_start_date.strftime('%Y-%m')
                 end_str = oos_end_date.strftime('%Y-%m')
                 
+                # Fallback to requested defaults if available in options
+                default_start = "2000-01" if "2000-01" in [d.strftime('%Y-%m') for d in all_dates[min_train:]] else start_str
+                default_end = "2010-10" if "2010-10" in [d.strftime('%Y-%m') for d in all_dates[min_train:]] else end_str
+
                 selected_range = st.select_slider(
                     "Select Simulation Period",
                     options=[d.strftime('%Y-%m') for d in all_dates[min_train:]],
-                    value=(start_str, end_str)
+                    value=(default_start, default_end)
                 )
                 sim_start, sim_end = selected_range
             else:
@@ -2585,16 +2589,16 @@ def main():
             with ac3:
                 st.markdown("**GOLD**")
                 min_gold = st.slider("Min Gold %", 0, 100, 0, key="min_gold")
-                max_gold = st.slider("Max Gold %", 0, 100, 100, key="max_gold")
+                max_gold = st.slider("Max Gold %", 0, 100, 15, key="max_gold")
 
             st.divider()
             st.markdown(f"**4. {strategy_type} Parameters**")
             col_lab1, col_lab2 = st.columns(2)
             with col_lab1:
                 initial_capital = st.number_input("Initial Capital ($)", value=10000, step=1000)
-                trading_cost = st.slider("Trading Cost (bps)", 0, 50, 10)
+                trading_cost = st.slider("Trading Cost (bps)", 0, 50, 30)
             with col_lab2:
-                rebalance_freq = st.selectbox("Rebalance Frequency", [1, 3, 12], format_func=lambda x: f"Every {x} Month(s)")
+                rebalance_freq = st.selectbox("Rebalance Frequency", [1, 3, 12], index=1, format_func=lambda x: f"Every {x} Month(s)")
             
             # Dynamic Parameters (Rendered inside form)
             params = {}
@@ -2607,9 +2611,9 @@ def main():
             elif strategy_type == "Max Return":
                 st.divider()
                 mc1, mc2, mc3 = st.columns(3)
-                params['max_weight'] = mc1.slider("Max Combined Weight", 0.5, 1.0, 0.8)
-                params['top_n'] = mc2.slider("Top N Assets", 1, 3, 1)
-                params['weighting_scheme'] = mc3.selectbox("Weighting Scheme", ["Equal", "Proportional"])
+                params['max_weight'] = mc1.slider("Max Combined Weight", 0.5, 1.0, 1.0)
+                params['top_n'] = mc2.slider("Top N Assets", 1, 3, 3)
+                params['weighting_scheme'] = mc3.selectbox("Weighting Scheme", ["Equal", "Proportional"], index=1)
                 params['risk_free_rate'] = risk_free_rate
             elif strategy_type == "Min Volatility":
                 st.divider()
@@ -2619,11 +2623,11 @@ def main():
                 lc1, lc2, lc3 = st.columns(3)
                 params['confidence_threshold'] = lc1.slider("Confidence Threshold", -0.05, 0.05, 0.0, step=0.005, format="%.3f")
                 params['rank_by'] = lc2.selectbox("Rank Qualified Assets By", ["Lower CI", "Expected Return"])
-                params['max_weight'] = lc3.slider("Max Combined Weight", 0.1, 1.0, 0.8)
+                params['max_weight'] = lc3.slider("Max Combined Weight", 0.1, 1.0, 1.0)
                 
                 lc4, lc5 = st.columns(2)
                 params['top_n'] = lc4.slider("Top N Assets", 1, 3, 3)
-                params['weighting_scheme'] = lc5.selectbox("Weighting Scheme", ["Equal", "Proportional"])
+                params['weighting_scheme'] = lc5.selectbox("Weighting Scheme", ["Equal", "Proportional"], index=1)
             
             st.divider()
             submitted = st.form_submit_button("🚀 RUN STRATEGY SIMULATION", width='stretch', type="primary")
