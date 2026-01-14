@@ -265,13 +265,44 @@ class StrategyBacktester:
                 
         return weights
 
-    def _calc_weights_min_loss(self, **kwargs):
-        """Maximize Lower CI, only if > 0."""
+    def _calc_weights_min_loss(self, confidence_threshold=0.0, rank_by="Lower CI", max_weight=0.8, top_n=3, weighting_scheme="Equal", **kwargs):
+        """
+        Allocates to assets based on high-conviction safety.
+        Invests only if Lower CI > confidence_threshold.
+        If multiple qualify, ranks them and applies diversification logic.
+        """
         weights = pd.DataFrame(0.0, index=self.common_idx, columns=self.assets)
-        for date, row in self.lower_ci.iterrows():
-            if row.max() > 0:
-                best_asset = row.idxmax()
-                weights.at[date, best_asset] = 0.8 # Generic max weight
+        
+        for date, row_ci in self.lower_ci.iterrows():
+            # 1. Identify qualified assets (Lower CI > threshold)
+            qualified = row_ci[row_ci > confidence_threshold]
+            
+            if not qualified.empty:
+                # 2. Ranking logic
+                if rank_by == "Expected Return":
+                    # Rank qualified assets by their predicted mean return
+                    pred_row = self.predictions.loc[date]
+                    selected = pred_row[qualified.index].sort_values(ascending=False).head(top_n)
+                else: # Default: Rank by Lower CI
+                    selected = qualified.sort_values(ascending=False).head(top_n)
+                
+                n_selected = len(selected)
+                if n_selected > 0:
+                    if weighting_scheme == "Equal":
+                        for asset in selected.index:
+                            weights.at[date, asset] = max_weight / n_selected
+                    else: # Proportional
+                        # Split max_weight based on the ranking metric values
+                        # If rank_by is Expected Return, use predicted returns
+                        # If rank_by is Lower CI, use those values
+                        total_score = selected.sum()
+                        if total_score > 0:
+                            for asset, val in selected.items():
+                                weights.at[date, asset] = max_weight * (val / total_score)
+                        else:
+                            for asset in selected.index:
+                                weights.at[date, asset] = max_weight / n_selected
+                                
         return weights
 
     def _calc_weights_buy_hold(self, weights_dict=None, **kwargs):

@@ -2532,9 +2532,12 @@ def main():
 
             ### 💎 Min Loss (Safety-First Confidence)
             *   **Core Logic**: Uses the **Lower 95% Confidence Interval** of the predictions. This strategy requires 'high conviction'.
-            *   **Decision**: Instead of looking at what *might* happen (Mean), it looks at the *worst-case* (Lower CI). It only invests in an asset if its **Lower CI is > 0**.
-            *   **Allocation**: If multiple assets satisfy the condition, it picks the one with the highest Lower CI. If no asset qualifies, it moves **100% to Cash**.
-            *   **Goal**: Minimize the probability of negative returns by only taking bets when the model is statistically very confident in a positive outcome.
+            *   **Decision**: Instead of looking at what *might* happen (Mean), it looks at the *worst-case* (Lower CI). It only invests in an asset if its **Lower CI is > 'Confidence Threshold'**.
+            *   **Allocation**: 
+                *   If multiple assets satisfy the condition, they are ranked by either **'Lower CI'** (Safety-First) or **'Expected Return'** (Profit-Optimized).
+                *   It selects the top ranked assets (up to **'Top N Assets'**) and allocates the **'Max Combined Weight'** according to the chosen **'Weighting Scheme'**. 
+                *   If no asset qualifies, it moves **100% to Cash**.
+            *   **Goal**: Minimize the probability of negative returns by only taking bets when the model is statistically very confident in a positive outcome, while allowing for diversification among safe bets.
             """)
 
         with st.form("backtest_config_form"):
@@ -2594,6 +2597,16 @@ def main():
             elif strategy_type == "Min Volatility":
                 st.divider()
                 params['cov_lookback'] = st.slider("Covariance Lookback (Months)", 24, 120, 60)
+            elif strategy_type == "Min Loss":
+                st.divider()
+                lc1, lc2, lc3 = st.columns(3)
+                params['confidence_threshold'] = lc1.slider("Confidence Threshold", -0.05, 0.05, 0.0, step=0.005, format="%.3f")
+                params['rank_by'] = lc2.selectbox("Rank Qualified Assets By", ["Lower CI", "Expected Return"])
+                params['max_weight'] = lc3.slider("Max Combined Weight", 0.1, 1.0, 0.8)
+                
+                lc4, lc5 = st.columns(2)
+                params['top_n'] = lc4.slider("Top N Assets", 1, 3, 3)
+                params['weighting_scheme'] = lc5.selectbox("Weighting Scheme", ["Equal", "Proportional"])
             
             st.divider()
             submitted = st.form_submit_button("🚀 RUN STRATEGY SIMULATION", width='stretch', type="primary")
