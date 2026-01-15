@@ -2126,7 +2126,7 @@ def main():
         st.metric("Horizon", f"{horizon_months}m")
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "ALLOCATION", "STABLE DRIVERS", "SERIES", "BACKTEST", "DIAGNOSTIC", "STRATEGY LAB", "README"
+        "ALLOCATION", "STABLE DRIVERS", "SERIES", "PREDICTION", "DIAGNOSTIC", "BACKTEST", "README"
     ])
     with tab1:
         st.markdown(f'<div class="panel-header">EXPECTED {horizon_months}M RETURNS & STRATEGIC POSITIONING</div>', unsafe_allow_html=True)
