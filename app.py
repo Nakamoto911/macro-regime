@@ -2218,6 +2218,7 @@ def main():
             
     with tab2:
         st.markdown(f'<div class="panel-header">STABLE MACRO DRIVERS (PERSISTENCE > {int(min_persistence*100)}%)</div>', unsafe_allow_html=True)
+        st.info("💡 **Note**: Drivers identified based on full history (2000-Present). The Equations below are 'best fit' retrospective descriptions of the current regime.")
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
             with st.expander(f"Drivers & Equation for {asset}", expanded=(asset=='EQUITY')):
                 # Display Equation / Summary
