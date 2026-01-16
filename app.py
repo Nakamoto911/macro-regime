@@ -287,6 +287,7 @@ def estimate_with_hac(y: pd.Series, X: pd.DataFrame, lag: int = 11) -> dict:
     }
 
 
+
 def estimate_robust(y: pd.Series, X: pd.DataFrame) -> dict:
     """
     Robust regression (Huber) that is less sensitive to outliers (like 2008 or 2020).
@@ -452,19 +453,38 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
         # Clip predictions to realistic bounds
         pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=predict_idx)
         
-        # Estimate Forecast Error (SE) using In-Sample Residuals
-        se = np.std(y_train_all - model.predict(X_train_clean))
+        # -----------------------------------------------------------
+        # 4. HAC Adjustment for Overlapping Data (Horizon = 12)
+        # -----------------------------------------------------------
+        # 1. Calculate raw in-sample residuals
+        in_sample_preds = model.predict(X_train_clean)
+        residuals = y_train_all - in_sample_preds
+
+        # 2. Apply HAC Adjustment (Horizon = 12)
+        # Since we have 11/12 overlap, we inflate the standard error by sqrt(12)
+        # to correct for the underestimated variance due to autocorrelation.
+        hac_adjustment = np.sqrt(horizon_months) 
+        se_raw = np.std(residuals)
+        se_adjusted = se_raw * hac_adjustment
+
+        # 3. Adjust Degrees of Freedom for Effective Sample Size
+        # We effectively have 1 independent observation per year, not per month.
+        n_effective = len(y_train_all) / horizon_months
         n_features_used = X_train_clean.shape[1]
-        
-        t_crit = t.ppf(0.95, df=len(y_train_all)-n_features_used-1) if n_features_used > 0 else 1.66
-        
+        df_effective = max(1, int(n_effective - n_features_used - 1))
+
+        # 4. Calculate Critical Value with adjusted DF
+        t_crit = t.ppf(0.95, df=df_effective) 
+
+        # 5. Generate Bands using Adjusted SE
         for date in predict_idx:
             val = pred_vals.loc[date]
             results.append({
                 'date': date,
                 'predicted_return': val,
-                'lower_ci': val - (t_crit * se),
-                'upper_ci': val + (t_crit * se)
+                # Use se_adjusted here instead of raw se
+                'lower_ci': val - (t_crit * se_adjusted),
+                'upper_ci': val + (t_crit * se_adjusted)
             })
             
     if not results:
