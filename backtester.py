@@ -82,17 +82,29 @@ class StrategyBacktester:
         
         for t in range(n):
             # 1. Rebalance? (at start of period t)
-            # Weights decided at end of t-1 (or start of t) apply to returns of period t (t+1 in price terms)
-            if t % rebalance_freq == 0:
-                new_target = target_weights_arr[t]
-                # Calculate turnover
-                turnover_event = np.sum(np.abs(new_target - current_weights))
-                total_turnover += turnover_event
-                # Apply cost
-                cost_amount = equity_curve[t] * (turnover_event * cost_pct)
-                total_costs_paid += cost_amount
-                equity_curve[t] -= cost_amount
-                current_weights = new_target
+            # FIX: Lag signals by 1 period to remove look-ahead bias.
+            # We cannot trade at t=0 because we don't have a signal from t-1.
+            # The signal at index 't-1' was generated at the close of the previous period,
+            # so it is available to capture the return 'returns_arr[t]'.
+            
+            if t > 0:
+                # Check schedule: Shift logic so we trade at t=1 (first valid moment), t=1+freq, etc.
+                if (t - 1) % rebalance_freq == 0:
+                    new_target = target_weights_arr[t-1]  # Use signal from t-1
+                    
+                    # Calculate turnover
+                    turnover_event = np.sum(np.abs(new_target - current_weights))
+                    total_turnover += turnover_event
+                    
+                    # Apply cost
+                    cost_amount = equity_curve[t] * (turnover_event * cost_pct)
+                    total_costs_paid += cost_amount
+                    equity_curve[t] -= cost_amount
+                    
+                    current_weights = new_target
+            else:
+                # t=0: No valid prior signal. Stay in Cash (current_weights initialized to 0).
+                pass
             
             # 2. Apply returns
             # r_t is return from end of t-1 to end of t
