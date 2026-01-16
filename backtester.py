@@ -138,12 +138,10 @@ class StrategyBacktester:
         vol = returns.std() * np.sqrt(12)
         sharpe = (cagr - risk_free_rate) / vol if vol > 0 else 0
         
-        # Sortino Ratio (Standard MAR = risk_free_rate)
-        # We calculate excess returns relative to MAR (usually risk free rate or 0)
-        # Here we use standard industry practice: (CAGR - RF) / Downside Deviation
-        downside_returns = returns.copy()
-        # Downside is only when return < 0 (or < MAR, but 0 is standard for denominator)
-        downside_returns = np.minimum(0, returns)
+        # Sortino Ratio (Aligned MAR = risk_free_rate)
+        rf_monthly = risk_free_rate / 12.0
+        downside_returns = returns - rf_monthly
+        downside_returns = np.minimum(0, downside_returns)
         downside_std = np.sqrt(np.mean(downside_returns**2)) * np.sqrt(12)
         
         sortino = (cagr - risk_free_rate) / downside_std if downside_std > 0 else 0

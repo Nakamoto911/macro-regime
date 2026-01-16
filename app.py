@@ -3040,7 +3040,9 @@ def main():
                     # Rolling Sortino
                     def calc_sortino(x):
                         rets = x.pct_change().dropna()
-                        downside_rets = np.minimum(0, rets)
+                        # Sortino relative to RF
+                        rf_monthly = risk_free_rate / 12.0
+                        downside_rets = np.minimum(0, rets - rf_monthly)
                         downside_std = np.sqrt(np.mean(downside_rets**2)) * np.sqrt(12)
                         cagr = (x.iloc[-1] / x.iloc[0]) ** (12 / (len(x)-1)) - 1
                         return (cagr - risk_free_rate) / downside_std if downside_std > 0 else 0
@@ -3208,6 +3210,11 @@ def main():
                             def summarize_roll(roll_data):
                                 cagr = roll_data['cagr']
                                 avg_cagr = cagr.mean()
+                                avg_vol = roll_data['vol'].mean()
+                                
+                                # Ratio of Averages for Sharpe
+                                agg_sharpe = (avg_cagr - risk_free_rate) / avg_vol if avg_vol > 0 else 0
+                                
                                 return pd.Series({
                                     'Average Return': f"{avg_cagr:.2%}",
                                     '$10,000 Becomes': f"${10000 * (1 + avg_cagr)**holding_duration:,.0f}",
@@ -3216,9 +3223,9 @@ def main():
                                     'Median Return': f"{cagr.median():.2%}",
                                     '75th Percentile': f"{cagr.quantile(0.75):.2%}",
                                     'Max Return': f"{cagr.max():.2%}",
-                                    'Volatility': f"{roll_data['vol'].mean():.2%}",
-                                    'Sharpe Ratio': f"{roll_data['sharpe'].mean():.2f}",
-                                    'Sortino Ratio': f"{roll_data['sortino'].mean():.2f}",
+                                    'Volatility': f"{avg_vol:.2%}",
+                                    'Sharpe Ratio': f"{agg_sharpe:.2f}",
+                                    'Sortino Ratio': f"{roll_data['sortino'].median():.2f}",
                                     'Positive Periods': f"{(cagr > 0).mean():.1%}",
                                     'Max Drawdown': f"{roll_data['mdd'].min():.2%}"
                                 })
@@ -3254,7 +3261,7 @@ def main():
                                 'Max Return': 'The highest CAGR observed across all rolling windows.',
                                 'Volatility': 'Average annualized standard deviation of returns during the periods.',
                                 'Sharpe Ratio': 'Average risk-adjusted return (Excess Return / Volatility).',
-                                'Sortino Ratio': 'Average downside-risk-adjusted return (Excess Return / Downside Deviation).',
+                                'Sortino Ratio': 'Downside-risk-adjusted return relative to Risk-Free Rate. Table shows the MEDIAN of rolling Sortino ratios to prevent outlier artifacts.',
                                 'Positive Periods': 'The percentage of rolling windows that ended with a positive return.',
                                 'Max Drawdown': 'The maximum peak-to-trough decline observed across all rolling windows.',
                                 'Rebalancing Cost (Avg)': 'The average estimated cost of trading during the rolling period.'
