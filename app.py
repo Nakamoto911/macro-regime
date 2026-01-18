@@ -426,13 +426,17 @@ def stability_analysis(y: pd.Series, X: pd.DataFrame,
             hac_res = estimate_with_hac(y_valid, X_valid[selected_features], lag=horizon_months//2)
             coef_dict = hac_res['coefficients'].to_dict()
         else:
-            coef_dict = {col: 0.0 for col in X.columns}
+            coef_dict = {col: 0.0 for col in X_valid.columns}
+            
+        # Record window correlations for all features (univariate)
+        window_corrs = X_valid.corrwith(y_valid)
         
         results.append({
             'start_date': y.index[start],
             'end_date': y.index[end - 1],
             'selected_features': selected_features,
             'coefficients': coef_dict,
+            'correlations': window_corrs.to_dict(),
             'n_selected': len(selected_features)
         })
     
@@ -445,19 +449,25 @@ def compute_stability_metrics(stability_results: list, feature_names: list) -> p
     """
     n_windows = len(stability_results)
     if n_windows == 0:
-        return pd.DataFrame(columns=['feature', 'persistence', 'sign_consistency', 'magnitude_stability', 'mean_coefficient'])
+        return pd.DataFrame(columns=['feature', 'persistence', 'sign_consistency', 'magnitude_stability', 'mean_coefficient', 'correlation'])
         
     metrics = []
     for feat in feature_names:
         coefs = []
+        corrs = []
         for result in stability_results:
-            if feat in result['coefficients']:
+            if feat in result.get('coefficients', {}):
                 coefs.append(result['coefficients'][feat])
+            if feat in result.get('correlations', {}):
+                corrs.append(result['correlations'][feat])
         
         coefs = np.array(coefs)
         non_zero = coefs[coefs != 0]
         
         persistence = len(non_zero) / n_windows
+        
+        # Historical Link (Avg Correlation)
+        avg_corr = np.mean(corrs) if corrs else 0.0
         
         if len(non_zero) > 1:
             sign_consistency = max(
@@ -481,7 +491,8 @@ def compute_stability_metrics(stability_results: list, feature_names: list) -> p
             'persistence': persistence,
             'sign_consistency': sign_consistency,
             'magnitude_stability': magnitude_stability,
-            'mean_coefficient': mean_coef
+            'mean_coefficient': mean_coef,
+            'correlation': avg_corr
         })
     
     return pd.DataFrame(metrics)
@@ -1494,13 +1505,19 @@ def get_live_model_signals(y, X, l1_ratio, min_persistence, estimation_window_ye
             val = X_current_clean[feat].iloc[0]
             coef = beta[feat]
             impact = val * coef
+            # Safe access to metrics DataFrame
+            if feat in metrics.index:
+                feat_corr = metrics.loc[feat, 'correlation']
+            else:
+                feat_corr = 0
+                
             attr_data.append({
                 'feature': feat,
                 'Impact': impact,
                 'State': val,
                 'Weight': coef,
                 'Signal': 'BULLISH' if impact > 0.005 else 'BEARISH' if impact < -0.005 else 'NEUTRAL',
-                'Link': metrics[feat]['correlation'] if feat in metrics else 0
+                'Link': feat_corr
             })
         driver_attributions[asset] = pd.DataFrame(attr_data).sort_values('Impact', ascending=False)
         stability_results_map[asset] = {
@@ -2055,7 +2072,19 @@ def main():
         y_live, X_live, l1_ratio, min_persistence, estimation_window_years, horizon_months
     )
     
-    # B. Historic Backtest (Unbiased PIT Simulator) - Uses PIT Features
+    # B. Prediction Model Validation (Revised Data Simulator) - Uses Full Revised History Features
+    # Note: Diagnostic tab and Prediction tab use these results.
+    prediction_results, prediction_selection = get_historical_backtest(
+        y_live, X_live, 
+        min_train_months=240, 
+        horizon_months=horizon_months, 
+        rebalance_freq=12,
+        selection_threshold=min_persistence,
+        l1_ratio=l1_ratio
+    )
+    
+    # C. Historic Backtest (Unbiased PIT Simulator) - Uses PIT Features
+    # Note: 'Backtest' tab and Simulation Engine use these results.
     backtest_results, backtest_selection = get_historical_backtest(
         y_backtest, X_backtest, 
         min_train_months=240, 
@@ -2451,43 +2480,39 @@ def main():
             'BONDS': 'ElasticNetCV (Regularized Linear)',
             'GOLD': 'Simple OLS (Linear Regression)'
         }
-        st.info(f"Target Architecture: **{model_display_names.get(asset_to_plot)}** | Training Window: **240 Months**")
+        st.info(f"Target Architecture: **{model_display_names.get(asset_to_plot)}** | Training Window: **240 Months** | Data Variant: **Revised Macro Data**")
         
-        # Run Walk-Forward Backtest (Pre-calculated)
-        if st.button(f"🔍 VIEW BACKTEST FOR {asset_to_plot}", width='stretch'):
-            # Use pre-calculated unbiased results
-            oos_results = backtest_results.get(asset_to_plot, pd.DataFrame())
-            selection_history = backtest_selection.get(asset_to_plot, pd.DataFrame())
+        # Display Prediction results automatically (Revised Data)
+        # Use prediction results (Revised Data) for this tab
+        oos_results = prediction_results.get(asset_to_plot, pd.DataFrame())
+        
+        if not oos_results.empty:
+            # Align actual returns (Revised) with OOS predictions
+            actual_oos = y_live[asset_to_plot].loc[oos_results.index]
             
-            if not oos_results.empty:
-                # Align actual returns with OOS predictions
-                actual_oos = y_backtest[asset_to_plot].loc[oos_results.index]
-                
-                # Plot
-                fig_backtest = plot_backtest(
-                    actual_returns=actual_oos, 
-                    predicted_returns=oos_results['predicted_return'], 
-                    confidence_lower=oos_results['lower_ci'], 
-                    confidence_upper=oos_results['upper_ci'],
-                    confidence_level=confidence_level
-                )
-                
-                # Visual Cue: Update line style for OOS Prediction
-                for trace in fig_backtest.data:
-                    if trace.name == 'Predicted':
-                        trace.name = 'OOS Prediction (Walk-Forward)'
-                        trace.line.color = '#4da6ff'
-                
-                st.plotly_chart(fig_backtest, width='stretch')
-                
-                # Stats
-                corr = actual_oos.corr(oos_results['predicted_return'])
-                rmse = np.sqrt(((actual_oos - oos_results['predicted_return'])**2).mean())
-                st.markdown(f"**OOS Correlation:** {corr:.2f} | **OOS RMSE:** {rmse:.2%}")
-            else:
-                st.warning("Insufficient data for Walk-Forward Backtest.")
+            # Plot
+            fig_backtest = plot_backtest(
+                actual_returns=actual_oos, 
+                predicted_returns=oos_results['predicted_return'], 
+                confidence_lower=oos_results['lower_ci'], 
+                confidence_upper=oos_results['upper_ci'],
+                confidence_level=confidence_level
+            )
+            
+            # Visual Cue: Update line style for OOS Prediction
+            for trace in fig_backtest.data:
+                if trace.name == 'Predicted':
+                    trace.name = 'OOS Prediction (Walk-Forward)'
+                    trace.line.color = '#4da6ff'
+            
+            st.plotly_chart(fig_backtest, width='stretch')
+            
+            # Stats
+            corr = actual_oos.corr(oos_results['predicted_return'])
+            rmse = np.sqrt(((actual_oos - oos_results['predicted_return'])**2).mean())
+            st.markdown(f"**OOS Correlation:** {corr:.2f} | **OOS RMSE:** {rmse:.2%}")
         else:
-            st.info(f"Click the button above to run the 20-year walk-forward backtest for {asset_to_plot}.")
+            st.warning("Insufficient data for Walk-Forward Model Validation.")
 
     with tab5:
         col_d1, col_d2 = st.columns(2)
@@ -2514,7 +2539,7 @@ def main():
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
             with st.expander(f"Diagnostics for {asset}", expanded=(asset == 'EQUITY')):
                 if st.button(f"📊 VIEW {asset} DIAGNOSTICS", key=f"btn_diag_{asset}"):
-                    selection_df = backtest_selection.get(asset, pd.DataFrame())
+                    selection_df = prediction_selection.get(asset, pd.DataFrame())
                         
                     if not selection_df.empty:
                         st.markdown("### Feature Selection Persistence")
