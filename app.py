@@ -189,10 +189,10 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
     results = []
     selection_history = []
     # --- Global Optimization: Sanitize once outside the loop ---
-    X = X.apply(pd.to_numeric, errors='coerce').fillna(0)
-    y = y.apply(pd.to_numeric, errors='coerce').dropna()
+    X = X.apply(pd.to_numeric, errors='coerce')
+    y = y.apply(pd.to_numeric, errors='coerce')
     
-    # Intersect again after dropna(y)
+    # Intersect to ensure common dates where we have BOTH features and target
     common_global = X.index.intersection(y.index)
     X = X.loc[common_global]
     y = y.loc[common_global]

@@ -100,7 +100,7 @@ class MacroFeatureExpander:
         features = pd.concat(expanded_list, axis=1)
         # Deduplicate features (keep first)
         unique_features = features.loc[:, ~features.columns.duplicated()]
-        return unique_features.dropna()
+        return unique_features
 
 
 def prepare_macro_features(macro_data: pd.DataFrame) -> pd.DataFrame:
@@ -275,9 +275,11 @@ def load_hybrid_asset_data(start_date: str = '1959-01-01', macro_file: str = '20
         # Backcast Loop
         current_price = head.iloc[0]
         history = []
-        tail_returns = proxy_ret.loc[:t_splice].iloc[::-1]
         
-        for date, ret in tail_returns.items():
+        # Get proxy returns and filter for the backcast period (strictly before t_splice)
+        proxy_ret_backcast = proxy_ret[:t_splice].iloc[:-1].iloc[::-1] # Step backwards from t_splice
+        
+        for date, ret in proxy_ret_backcast.items():
             if date >= t_splice or pd.isna(ret):
                 continue
             prev_price = current_price / (1 + ret)
@@ -297,7 +299,7 @@ def load_hybrid_asset_data(start_date: str = '1959-01-01', macro_file: str = '20
     spliced_data = spliced_data.replace([np.inf, -np.inf], np.nan)
     spliced_data = spliced_data.where(spliced_data > 0, np.nan) # Prices must be positive
     
-    return spliced_data.sort_index().apply(pd.to_numeric, errors='coerce').dropna()
+    return spliced_data.sort_index().apply(pd.to_numeric, errors='coerce')
 
 
 def load_asset_data(start_date: str = '1959-01-01', macro_file: str = '2025-11-MD.csv') -> pd.DataFrame:

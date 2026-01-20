@@ -110,15 +110,21 @@ class FactorStripper(BaseEstimator, TransformerMixin):
         available_drivers = [d for d in self.drivers if d in X_df.columns]
         
         for driver in available_drivers:
-            driver_series = X_df[driver].values.reshape(-1, 1)
+            # We need to handle NaNs for each driver-feature pair independently
             self.models_[driver] = {}
+            driver_data = X_df[driver]
             
             for col in X_df.columns:
                 if col == driver:
                     continue
-                # Regress col on driver
+                
+                # Regress col on driver, but ONLY where both have data
+                pair_df = X_df[[col, driver]].dropna()
+                if len(pair_df) < 24: # Need minimum history to fit a relationship
+                    continue
+                    
                 lr = LinearRegression()
-                lr.fit(driver_series, X_df[col])
+                lr.fit(pair_df[[driver]].values, pair_df[col].values)
                 self.models_[driver][col] = lr
         return self
 
@@ -129,12 +135,29 @@ class FactorStripper(BaseEstimator, TransformerMixin):
         for driver, models in self.models_.items():
             if driver not in X_df.columns:
                 continue
-            driver_series = X_df[driver].values.reshape(-1, 1)
+            
+            driver_series = X_df[driver]
+            # Only predict where driver has data
+            valid_driver_mask = driver_series.notna()
+            if not valid_driver_mask.any():
+                continue
+                
+            driver_input = driver_series.loc[valid_driver_mask].values.reshape(-1, 1)
+            
             for col, model in models.items():
                 if col not in X_df.columns:
                     continue
-                pred = model.predict(driver_series)
-                resid = X_df[col].values - pred
+                
+                # Initialize with NaNs
+                resid = np.full(len(X_df), np.nan)
+                
+                # Predict only for valid driver dates
+                preds = model.predict(driver_input)
+                
+                # Calculate residue: Actual - Predicted
+                # Note: Actual might still be NaN at some of these dates, which is fine
+                resid[valid_driver_mask] = X_df[col].loc[valid_driver_mask].values - preds
+                
                 new_cols[f"{col}_resid_{driver}"] = resid
                 
         if new_cols:
