@@ -9,6 +9,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from scipy.stats import t as t_dist
 from xgboost import XGBRegressor
 import time
+from joblib import Parallel, delayed
 
 from benchmarking_engine import (
     Winsorizer,
@@ -80,6 +81,83 @@ def estimate_robust(y: pd.Series, X: pd.DataFrame) -> dict:
         'fitted_values': model.predict(X_clipped)
     }
 
+def _perform_feature_selection_step(current_date, y, X_expanded_global, horizon_months, asset_class):
+    """Helper for parallel feature selection."""
+    train_limit = current_date - pd.DateOffset(months=horizon_months)
+    mask_train = X_expanded_global.index <= train_limit
+    
+    X_train_prep = X_expanded_global.loc[mask_train]
+    y_train_prep = y.loc[mask_train].dropna()
+    
+    common_train = X_train_prep.index.intersection(y_train_prep.index)
+    X_train_prep = X_train_prep.loc[common_train]
+    y_train_prep = y_train_prep.loc[common_train]
+    
+    if len(y_train_prep) < 60:
+        return current_date, [], 0.5, 0.5
+        
+    selector = AdaptiveFeatureSelector(asset_class=asset_class)
+    # Reduce bootstrap slightly for speed in parallel mode
+    selector.fit(y_train_prep, X_train_prep, n_bootstrap=10) 
+    cached_features = selector.get_selected_features()
+    if not cached_features: 
+        cached_features = X_train_prep.columns[:10].tolist()
+        
+    return current_date, cached_features, selector.selector.best_alpha_, selector.selector.best_l1_ratio_
+
+def _perform_prediction_step(current_date, predict_idx, y, X_expanded_global, horizon_months, 
+                           stable_feats, best_alpha, best_l1, asset_class, confidence_level):
+    """Helper for parallel prediction."""
+    train_limit = current_date - pd.DateOffset(months=horizon_months)
+    mask_train = X_expanded_global.index <= train_limit
+    
+    X_train_prep = X_expanded_global.loc[mask_train]
+    y_train_prep = y.loc[mask_train].dropna()
+    
+    common_train = X_train_prep.index.intersection(y_train_prep.index)
+    X_train_prep = X_train_prep.loc[common_train]
+    y_train_prep = y_train_prep.loc[common_train]
+    
+    X_test_expanded = X_expanded_global.loc[X_expanded_global.index.intersection(predict_idx)]
+    
+    X_train_sel = X_train_prep[stable_feats]
+    X_test_sel = X_test_expanded[stable_feats]
+    
+    win = Winsorizer(threshold=3.0)
+    X_train_final = win.fit_transform(X_train_sel).fillna(0)
+    X_test_final = win.transform(X_test_sel).fillna(0)
+    
+    if X_test_final.empty or X_train_final.empty:
+        raw_preds = np.zeros(len(predict_idx))
+        lower_ci, upper_ci = raw_preds, raw_preds
+    else:
+        if asset_class in ['BONDS', 'GOLD']:
+            if asset_class == 'BONDS':
+                model = ElasticNet(alpha=best_alpha, l1_ratio=best_l1, max_iter=1000)
+            else:
+                model = LinearRegression()
+            
+            model.fit(X_train_final, y_train_prep)
+            raw_preds = model.predict(X_test_final)
+            residuals = y_train_prep - model.predict(X_train_final)
+            rse = np.std(residuals)
+            dof = len(y_train_prep) - X_train_final.shape[1] - 1
+            t_crit = t_dist.ppf((1 + confidence_level) / 2, df=max(1, dof))
+            margin = t_crit * rse
+            lower_ci = raw_preds - margin
+            upper_ci = raw_preds + margin
+        else:
+            model = XGBRegressor(n_estimators=25, max_depth=3, learning_rate=0.08, random_state=42, n_jobs=1)
+            model.fit(X_train_final, y_train_prep)
+            raw_preds = model.predict(X_test_final)
+            bt_interval = BootstrapPredictionInterval(confidence_level=confidence_level, n_bootstrap=20)
+            bt_interval.fit(model, X_train_final, y_train_prep)
+            _, lower_ci, upper_ci = bt_interval.predict_interval(X_test_final)
+
+        raw_preds = np.clip(raw_preds, -0.50, 0.50)
+        
+    return current_date, X_test_final.index, raw_preds, lower_ci, upper_ci
+
 def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame, 
                               min_train_months: int = 240, 
                               horizon_months: int = 12,
@@ -90,7 +168,7 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
                               confidence_level: float = 0.90,
                               progress_cb=None,
                               X_precomputed: pd.DataFrame = None) -> tuple:
-    """Researcher-Grade Optimized Backtester."""
+    """Researcher-Grade Optimized Backtester with Parallel Execution."""
     results = []
     selection_history = []
     coverage_validator = CoverageValidator(nominal_level=confidence_level)
@@ -120,100 +198,123 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
     y = y.loc[common_calc]
     dates = X_expanded_global.index
 
-    cached_features = [] 
-    step_count = 0
-    total_steps = len(range(start_idx, len(dates), rebalance_freq))
-
-    for i in range(start_idx, len(dates), rebalance_freq):
+    # 1. Plan Execution Steps
+    steps = list(range(start_idx, len(dates), rebalance_freq))
+    selection_dates = []
+    step_map = [] # (current_date, selection_date_to_use)
+    
+    last_sel_date = None
+    
+    # Determine which steps trigger new feature selection
+    for i in steps:
         current_date = dates[i]
-        step_count += 1
+        # Logic: Update features if it's the first step, or if it's January (and freq < 12), or if freq >= 12
+        needs_update = (last_sel_date is None) or \
+                       (current_date.month == 1 and rebalance_freq < 12) or \
+                       (rebalance_freq >= 12)
         
-        train_limit = current_date - pd.DateOffset(months=horizon_months)
-        mask_train = X_expanded_global.index <= train_limit
-        
-        X_train_prep = X_expanded_global.loc[mask_train]
-        y_train_prep = y.loc[mask_train].dropna()
-        
-        common_train = X_train_prep.index.intersection(y_train_prep.index)
-        X_train_prep = X_train_prep.loc[common_train]
-        y_train_prep = y_train_prep.loc[common_train]
-        
-        if len(y_train_prep) < 60: continue
+        if needs_update:
+            last_sel_date = current_date
+            selection_dates.append(current_date)
             
         predict_idx = dates[i : min(i + rebalance_freq, len(dates))]
-        X_test_expanded = X_expanded_global.loc[X_expanded_global.index.intersection(predict_idx)]
-        
-        if not cached_features or (current_date.month == 1 and rebalance_freq < 12) or rebalance_freq >= 12:
-            selector = AdaptiveFeatureSelector(asset_class=asset_class)
-            selector.fit(y_train_prep, X_train_prep, n_bootstrap=10) 
-            cached_features = selector.get_selected_features()
-            if not cached_features: cached_features = X_train_prep.columns[:10].tolist()
-            best_alpha = selector.selector.best_alpha_
-            best_l1 = selector.selector.best_l1_ratio_
-            
-        stable_feats = cached_features
-        X_train_sel = X_train_prep[stable_feats]
-        X_test_sel = X_test_expanded[stable_feats]
-        
-        win = Winsorizer(threshold=3.0)
-        X_train_final = win.fit_transform(X_train_sel).fillna(0)
-        X_test_final = win.transform(X_test_sel).fillna(0)
-        
-        selection_history.append({'selected': stable_feats, 'date': current_date})
+        step_map.append({
+            'current_date': current_date,
+            'predict_idx': predict_idx,
+            'sel_date': last_sel_date
+        })
 
-        if X_test_final.empty or X_train_final.empty:
-            raw_preds = np.zeros(len(predict_idx))
-            lower_ci, upper_ci = raw_preds, raw_preds
-        else:
-            if asset_class in ['BONDS', 'GOLD']:
-                if asset_class == 'BONDS':
-                    model = ElasticNet(alpha=best_alpha, l1_ratio=best_l1, max_iter=1000)
-                else:
-                    model = LinearRegression()
-                
-                model.fit(X_train_final, y_train_prep)
-                raw_preds = model.predict(X_test_final)
-                residuals = y_train_prep - model.predict(X_train_final)
-                rse = np.std(residuals)
-                dof = len(y_train_prep) - X_train_final.shape[1] - 1
-                t_crit = t_dist.ppf((1 + confidence_level) / 2, df=max(1, dof))
-                margin = t_crit * rse
-                lower_ci = raw_preds - margin
-                upper_ci = raw_preds + margin
-            else:
-                model = XGBRegressor(n_estimators=25, max_depth=3, learning_rate=0.08, random_state=42, n_jobs=1)
-                model.fit(X_train_final, y_train_prep)
-                raw_preds = model.predict(X_test_final)
-                bt_interval = BootstrapPredictionInterval(confidence_level=confidence_level, n_bootstrap=20)
-                bt_interval.fit(model, X_train_final, y_train_prep)
-                _, lower_ci, upper_ci = bt_interval.predict_interval(X_test_final)
+    # 2. Parallel Feature Selection
+    # Run heavy selection tasks in parallel
+    if progress_cb: progress_cb(0.1, dates[steps[0]])
+    
+    sel_results = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_perform_feature_selection_step)(d, y, X_expanded_global, horizon_months, asset_class)
+        for d in selection_dates
+    )
+    
+    # Map results for O(1) lookup
+    feature_cache = {
+        res[0]: {'features': res[1], 'alpha': res[2], 'l1': res[3]} 
+        for res in sel_results
+    }
+    
+    # Store history
+    for d in selection_dates:
+        selection_history.append({'selected': feature_cache[d]['features'], 'date': d})
 
-            raw_preds = np.clip(raw_preds, -0.50, 0.50)
-            
-        if progress_cb:
-            pct = step_count / total_steps
-            progress_cb(pct, current_date)
+    # 3. Parallel Prediction
+    if progress_cb: progress_cb(0.5, dates[steps[len(steps)//2]])
+    
+    pred_results = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_perform_prediction_step)(
+            step['current_date'], 
+            step['predict_idx'],
+            y, X_expanded_global, horizon_months,
+            feature_cache[step['sel_date']]['features'],
+            feature_cache[step['sel_date']]['alpha'],
+            feature_cache[step['sel_date']]['l1'],
+            asset_class, confidence_level
+        )
+        for step in step_map
+    )
 
-        pred_vals = pd.Series(raw_preds, index=X_test_final.index)
-        for idx, date in enumerate(pred_vals.index):
+    # 4. Aggregate Results
+    if progress_cb: progress_cb(0.9, dates[-1])
+    
+    for _, idxs, raw_preds, l_ci, u_ci in pred_results:
+        pred_vals = pd.Series(raw_preds, index=idxs)
+        for i, date in enumerate(idxs):
             if date in y.index:
                 actual_ret = y.loc[date]
                 val = pred_vals.loc[date]
-                l_ci = lower_ci[idx] if isinstance(lower_ci, (list, np.ndarray)) else lower_ci
-                u_ci = upper_ci[idx] if isinstance(upper_ci, (list, np.ndarray)) else upper_ci
-                coverage_validator.record(actual_ret, l_ci, u_ci)
-                results.append({'date': date, 'predicted_return': val, 'lower_ci': l_ci, 'upper_ci': u_ci})
+                l = l_ci[i] if isinstance(l_ci, (list, np.ndarray)) else l_ci
+                u = u_ci[i] if isinstance(u_ci, (list, np.ndarray)) else u_ci
+                
+                coverage_validator.record(actual_ret, l, u)
+                results.append({'date': date, 'predicted_return': val, 'lower_ci': l, 'upper_ci': u})
             
     if not results:
         return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci']), pd.DataFrame(), {}
         
-    oos_df = pd.DataFrame(results).set_index('date')
-    selection_df = pd.DataFrame(selection_history).set_index('date')
+    oos_df = pd.DataFrame(results).set_index('date').sort_index()
+    selection_df = pd.DataFrame(selection_history).set_index('date').sort_index()
+    
     return oos_df, selection_df, coverage_validator.compute_statistics()
 
 @st.cache_data(show_spinner=False)
 def cached_walk_forward(y, X, min_train_months=240, horizon_months=12, rebalance_freq=12, asset_class='EQUITY', confidence_level=0.90):
     return run_walk_forward_backtest(y, X, min_train_months, horizon_months, rebalance_freq, asset_class, confidence_level=confidence_level)
+
+def _process_stability_window(start, end, y, X, horizon_months, inference_method):
+    """Helper for parallel stability analysis."""
+    y_window = y.iloc[start:end]
+    X_window = X.iloc[start:end]
+    y_valid = y_window.dropna()
+    X_valid = X_window.loc[y_valid.index].dropna(axis=1)
+    
+    if len(y_valid) < 120 or X_valid.empty:
+        return None
+        
+    selected_features, selection_probs = select_features_elastic_net(y_valid, X_valid)
+    
+    if selected_features:
+        estimation_config = {'inference_method': inference_method, 'horizon': horizon_months}
+        inf_res = estimate_with_corrected_inference(y_valid, X_valid[selected_features], estimation_config)
+        coef_dict = inf_res['coefficients'].to_dict()
+    else:
+        coef_dict = {col: 0.0 for col in X_valid.columns}
+        
+    window_corrs = X_valid.corrwith(y_valid)
+    
+    return {
+        'start_date': y.index[start], 
+        'end_date': y.index[end - 1],
+        'selected_features': selected_features, 
+        'coefficients': coef_dict,
+        'correlations': window_corrs.to_dict(), 
+        'n_selected': len(selected_features)
+    }
 
 def stability_analysis(y: pd.Series, X: pd.DataFrame, horizon_months: int = 12, window_years: int = 25, step_years: int = 5) -> list:
     common = y.index.intersection(X.index)
@@ -221,28 +322,20 @@ def stability_analysis(y: pd.Series, X: pd.DataFrame, horizon_months: int = 12, 
     X = X.loc[common]
     window_months = window_years * 12
     step_months = step_years * 12
-    results = []
+    
+    tasks = []
     for start in range(0, len(y) - window_months, step_months):
         end = start + window_months
-        y_window = y.iloc[start:end]
-        X_window = X.iloc[start:end]
-        y_valid = y_window.dropna()
-        X_valid = X_window.loc[y_valid.index].dropna(axis=1)
-        if len(y_valid) < 120 or X_valid.empty: continue
-        selected_features, selection_probs = select_features_elastic_net(y_valid, X_valid)
-        if selected_features:
-            estimation_config = {'inference_method': st.session_state.get('inference_method', 'Hodrick (1992)'), 'horizon': horizon_months}
-            inf_res = estimate_with_corrected_inference(y_valid, X_valid[selected_features], estimation_config)
-            coef_dict = inf_res['coefficients'].to_dict()
-        else:
-            coef_dict = {col: 0.0 for col in X_valid.columns}
-        window_corrs = X_valid.corrwith(y_valid)
-        results.append({
-            'start_date': y.index[start], 'end_date': y.index[end - 1],
-            'selected_features': selected_features, 'coefficients': coef_dict,
-            'correlations': window_corrs.to_dict(), 'n_selected': len(selected_features)
-        })
-    return results
+        tasks.append((start, end))
+        
+    inference_method = st.session_state.get('inference_method', 'Hodrick (1992)')
+    
+    results = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(_process_stability_window)(start, end, y, X, horizon_months, inference_method)
+        for start, end in tasks
+    )
+    
+    return [r for r in results if r is not None]
 
 def compute_stability_metrics(stability_results: list, feature_names: list) -> pd.DataFrame:
     n_windows = len(stability_results)

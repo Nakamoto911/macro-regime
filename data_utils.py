@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import pandas_datareader.data as web
 import os
+import time
 from yahooquery import Ticker
 from feature_engine.timeseries.forecasting import ExpandingWindowFeatures
 
@@ -255,16 +256,22 @@ def load_hybrid_asset_data(start_date: str = '1959-01-01', macro_file: str = '20
     # 2. Fetch ETF Heads (Yahoo Finance)
     etf_map = {'SPY': 'EQUITY', 'IEF': 'BONDS', 'GLD': 'GOLD'}
     df_etfs = pd.DataFrame()
-    try:
-        t = Ticker(list(etf_map.keys()), asynchronous=False)
-        df_etf_raw = t.history(period='max', interval='1d')
-        if not df_etf_raw.empty:
-            df_etfs = df_etf_raw.reset_index().pivot(index='date', columns='symbol', values='adjclose')
-            df_etfs = df_etfs.rename(columns=etf_map)
-            df_etfs.index = pd.to_datetime(df_etfs.index, utc=True).tz_localize(None)
-            df_etfs = df_etfs.resample('ME').last()
-    except Exception as e:
-        print(f"Error fetching ETF data: {e}")
+    retry_count = 3
+    for attempt in range(retry_count):
+        try:
+            t = Ticker(list(etf_map.keys()), asynchronous=False)
+            df_etf_raw = t.history(period='max', interval='1d')
+            if not df_etf_raw.empty:
+                df_etfs = df_etf_raw.reset_index().pivot(index='date', columns='symbol', values='adjclose')
+                df_etfs = df_etfs.rename(columns=etf_map)
+                df_etfs.index = pd.to_datetime(df_etfs.index, utc=True).tz_localize(None)
+                df_etfs = df_etfs.resample('ME').last()
+                break
+        except Exception as e:
+            if attempt == retry_count - 1:
+                print(f"Error fetching ETF data after {retry_count} attempts: {e}")
+            else:
+                time.sleep(1) # Wait before retry
 
     # 3. Independent Splice Engine (Ratio Splicing)
     spliced_results = {}

@@ -98,7 +98,7 @@ def render_allocation_tab(horizon_months, expected_returns, confidence_intervals
         summary_data.append({'Asset': asset, 'Expected Return': f"{exp:.1%}", f'{int(confidence_level*100)}% CI': f"[{ci[0]:.1%}, {ci[1]:.1%}]", 'vs Historical': f"{diff:+.1%}", 'Recommendation': rec, 'Target Weight': f"{target_weights.get(asset, 0):.0%}"})
     st.dataframe(pd.DataFrame(summary_data), hide_index=True, width='stretch')
     c1, c2 = st.columns([1, 2])
-    with c1: st.plotly_chart(plot_allocation(target_weights), use_container_width=True)
+    with c1: st.plotly_chart(plot_allocation(target_weights), width='stretch')
     with c2:
         st.markdown('<div class="panel-header">STRATEGIC RATIONALE</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="background:var(--bg-secondary); border:1px solid var(--border-color); padding:1rem; border-radius:2px; font-size:0.85rem;">{generate_narrative(expected_returns, driver_attributions, regime_status)}</div>', unsafe_allow_html=True)
@@ -115,7 +115,7 @@ def render_drivers_tab(min_persistence, model_stats, driver_attributions, stabil
                 sel = st.dataframe(df_disp[['feature', 'Signal', 'Impact', 'Weight', 'State', 'Link']], hide_index=True, width='stretch', on_select='rerun', selection_mode='single-row', key=f"sel_{asset}")
                 if sel.get('selection', {}).get('rows'):
                     feat = df_disp.iloc[sel['selection']['rows'][0]]['feature']
-                    st.plotly_chart(plot_combined_driver_analysis(X_live, y_forward, feat, asset, descriptions, horizon_months=horizon_months), use_container_width=True)
+                    st.plotly_chart(plot_combined_driver_analysis(X_live, y_forward, feat, asset, descriptions, horizon_months=horizon_months), width='stretch')
 
 def render_series_tab(df_full, transform_codes, appendix, driver_attributions, y_live, descriptions):
     sel_col1, sel_col2, sel_col3, sel_col4, sel_col5, sel_col6 = st.columns([1.5, 1, 1, 1, 2, 3])
@@ -139,7 +139,7 @@ def render_series_tab(df_full, transform_codes, appendix, driver_attributions, y
 
     for col in series_to_plot:
         if col in df_full.columns:
-            st.plotly_chart(plot_fred_series(df_full[col], col, descriptions.get(col, ""), is_transformed=(mode!="Raw")), use_container_width=True)
+            st.plotly_chart(plot_fred_series(df_full[col], col, descriptions.get(col, ""), is_transformed=(mode!="Raw")), width='stretch')
 
 def render_prediction_tab(prediction_results, y_live, horizon_months, min_persistence, l1_ratio, confidence_level, X_live):
     if prediction_results is None:
@@ -151,7 +151,7 @@ def render_prediction_tab(prediction_results, y_live, horizon_months, min_persis
         asset = st.selectbox("Asset", ['EQUITY', 'BONDS', 'GOLD'])
         oos = prediction_results.get(asset, pd.DataFrame())
         if not oos.empty:
-            st.plotly_chart(plot_backtest(y_live[asset].loc[oos.index], oos['predicted_return'], oos['lower_ci'], oos['upper_ci'], confidence_level), use_container_width=True)
+            st.plotly_chart(plot_backtest(y_live[asset].loc[oos.index], oos['predicted_return'], oos['lower_ci'], oos['upper_ci'], confidence_level), width='stretch')
 
 def render_diagnostics_tab(stress_indicators, stability_results_map, prediction_selection, coverage_stats, descriptions):
     st.markdown("**Regime Indicators**")
@@ -160,9 +160,9 @@ def render_diagnostics_tab(stress_indicators, stability_results_map, prediction_
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
             with st.expander(f"Diagnostics for {asset}"):
                 sel_df = prediction_selection.get(asset, pd.DataFrame())
-                if not sel_df.empty: st.plotly_chart(plot_feature_heatmap(sel_df, descriptions), use_container_width=True)
-                st.plotly_chart(plot_stability_boxplot(stability_results_map, asset, descriptions), use_container_width=True)
-                st.plotly_chart(plot_variable_survival(stability_results_map, asset, descriptions), use_container_width=True)
+                if not sel_df.empty: st.plotly_chart(plot_feature_heatmap(sel_df, descriptions), width='stretch')
+                st.plotly_chart(plot_stability_boxplot(stability_results_map, asset, descriptions), width='stretch')
+                st.plotly_chart(plot_variable_survival(stability_results_map, asset, descriptions), width='stretch')
 
 def render_strategy_lab(asset_prices, prediction_results, y_backtest, X_backtest, horizon_months, min_persistence, l1_ratio, confidence_level, macro_data_current, risk_free_rate):
     with st.form("strategy_config"):

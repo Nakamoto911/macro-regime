@@ -10,6 +10,7 @@ pandas-datareader>=0.10.0
 setuptools
 scikit-learn
 statsmodels
+joblib>=1.3.0
 beautifulsoup4>=4.12.0
 xgboost
 tensorflow

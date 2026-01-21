@@ -46,10 +46,10 @@ def main():
     with st.sidebar:
         st.markdown('<div style="color: #ff6b35; font-family: monospace;">CONFIG & THEME</div>', unsafe_allow_html=True)
         t_col1, t_col2 = st.columns(2)
-        if t_col1.button("🌙 Dark", use_container_width=True): st.session_state.theme = 'dark'; st.rerun()
-        if t_col2.button("☀ Light", use_container_width=True): st.session_state.theme = 'light'; st.rerun()
-        
-        if st.button("🔄 Clean Cache & Re-Sync", use_container_width=True):
+        if t_col1.button("🌙 Dark", width='stretch'): st.session_state.theme = 'dark'; st.rerun()
+        if t_col2.button("☀ Light", width='stretch'): st.session_state.theme = 'light'; st.rerun()
+        st.markdown("---")
+        if st.button("🔄 Clean Cache & Re-Sync", width='stretch'):
             if os.path.exists('engine_state.pkl'): os.remove('engine_state.pkl')
             st.session_state.sync_triggered = False; st.session_state.engine_results = None
             st.cache_data.clear(); st.rerun()
@@ -95,7 +95,7 @@ def main():
     
     if not st.session_state.sync_triggered:
         st.warning("ALPHA ENGINE OFFLINE. Synchronize to generate insights.")
-        if st.button("🚀 START ALPHA ENGINE & RUN BACKTEST", use_container_width=True, type="primary"):
+        if st.button("🚀 START ALPHA ENGINE & RUN BACKTEST", width='stretch', type="primary"):
             st.session_state.sync_triggered = True; st.rerun()
         return
 

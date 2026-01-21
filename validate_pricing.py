@@ -239,7 +239,7 @@ for i, tab in enumerate(tabs):
                                 name="Divergence", line=dict(color='blue'), fill='tozeroy'), row=2, col=1)
         
         fig.update_layout(height=700, showlegend=True, template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 st.divider()
 st.info("""
