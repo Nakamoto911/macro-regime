@@ -3,6 +3,7 @@ import numpy as np
 import pandas_datareader.data as web
 import os
 from yahooquery import Ticker
+from feature_engine.timeseries.forecasting import ExpandingWindowFeatures
 
 try:
     import streamlit as st
@@ -96,6 +97,21 @@ class MacroFeatureExpander:
             
             # 5. Volatility
             expanded_list.append(series.rolling(12).std().rename(f'{col}_vol12'))
+            
+        # 6. Expanding Window Statistics (Vectorized Big Win)
+        # Generates expanding Mean, Min, Max for all base features
+        expanding = ExpandingWindowFeatures(
+            functions=["mean", "min", "max"],
+            variables=X.columns.tolist(),
+            missing_values='ignore'
+        )
+        X_expanding = expanding.fit_transform(X.ffill().fillna(0))
+        # ExpandingWindowFeatures appends with '_window_{func}' usually, 
+        # or just '_mean', '_min', '_max' depending on version.
+        # We filter for these new columns.
+        new_expanding_cols = [c for c in X_expanding.columns if c not in X.columns]
+        if new_expanding_cols:
+            expanded_list.append(X_expanding[new_expanding_cols])
             
         features = pd.concat(expanded_list, axis=1)
         # Deduplicate features (keep first)

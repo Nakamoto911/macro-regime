@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression, HuberRegressor, ElasticNetCV, ElasticNet
+import statsmodels.api as sm
+from statsmodels.regression.rolling import RollingOLS
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.dummy import DummyRegressor
 from sklearn.metrics import mean_squared_error
@@ -196,7 +198,8 @@ class PointInTimeFactorStripper(BaseEstimator, TransformerMixin):
         
     def fit_transform_pit(self, X: pd.DataFrame, progress_cb=None) -> pd.DataFrame:
         """
-        Point-in-time fit and transform in a single pass.
+        Vectorized Point-in-time fit and transform using RollingOLS.
+        Eliminates slow looping over time steps.
         """
         X = X.sort_index()
         dates = X.index
@@ -206,61 +209,48 @@ class PointInTimeFactorStripper(BaseEstimator, TransformerMixin):
         if not available_drivers:
             return X
         
-        # Pre-allocate result arrays for efficiency
         feature_cols = [c for c in X.columns if c not in available_drivers]
-        resid_col_names = [f"{col}_resid_{drv}" 
-                          for col in feature_cols 
-                          for drv in available_drivers]
+        resid_df = pd.DataFrame(index=dates)
         
-        result_data = np.full((n, len(resid_col_names)), np.nan)
-        
-        current_coefficients = {}  # driver -> {feature -> (coef, intercept)}
-        last_update_idx = -self.update_frequency - 1 # Force update on first valid point
-        
-        # Pre-extract values for fast access
-        X_values = X.values
-        driver_indices = [X.columns.get_loc(d) for d in available_drivers]
-        feature_indices = [X.columns.get_loc(f) for f in feature_cols]
-        
-        for t_idx in range(self.min_history, n, self.update_frequency):
-            # 1. Update coefficients (Fit on data [0, t_idx - 1])
-            if t_idx % 60 <= self.update_frequency: # Log roughly every 5 years
-                print(f"DEBUG: PIT Orthogonalization Progress: {t_idx}/{n} steps")
+        for drv in available_drivers:
+            # Exog is the driver plus a constant
+            exog = sm.add_constant(X[drv])
             
-            X_train = X.iloc[:t_idx]
-            current_coefficients = self._fit_coefficients(X_train, available_drivers)
-            self.coefficient_history_[dates[t_idx]] = current_coefficients.copy()
-            
-            # 2. Apply current coefficients to the NEXT block of data [t_idx, t_idx + update_frequency - 1]
-            end_idx = min(t_idx + self.update_frequency, n)
-            block_slice = slice(t_idx, end_idx)
-            
-            col_idx = 0
-            for f_idx in feature_indices:
-                feat_name = feature_cols[feature_indices.index(f_idx)]
-                actual_vals = X_values[block_slice, f_idx]
+            for col in feature_cols:
+                # Endog is the feature to be orthogonalized
+                endog = X[col]
                 
-                for d_idx in driver_indices:
-                    drv_name = available_drivers[driver_indices.index(d_idx)]
-                    
-                    if drv_name in current_coefficients and feat_name in current_coefficients[drv_name]:
-                        coef, intercept = current_coefficients[drv_name][feat_name]
-                        driver_vals_block = X_values[block_slice, d_idx]
-                        
-                        # Vectorized application
-                        predicted = coef * driver_vals_block + intercept
-                        result_data[block_slice, col_idx] = actual_vals - predicted
-                        
-                    col_idx += 1
-            
-            # Progress reporting
+                # We use Expanding Window: window=len(X), min_nobs=self.min_history
+                # RollingOLS is highly optimized in Cython
+                rols = RollingOLS(endog=endog, exog=exog, window=n, min_nobs=self.min_history, expanding=True)
+                rres = rols.fit()
+                
+                # Get params (intercept and driver coef)
+                # params has columns ['const', drv]
+                # We need params available at t-1 to apply at t (Point-In-Time)
+                # So we shift by 1
+                params_pit = rres.params.shift(1)
+                
+                # Calculate predicted: const + coef * driver
+                # Note: X[drv] and params_pit[drv] are aligned on index
+                predicted = params_pit['const'] + params_pit[drv] * X[drv]
+                
+                # Residue: Actual - Predicted
+                resid_df[f"{col}_resid_{drv}"] = X[col] - predicted
+                
+                # Store latest coefficients for future transform calls
+                if dates[-1] not in self.coefficient_history_:
+                    self.coefficient_history_[dates[-1]] = {}
+                if drv not in self.coefficient_history_[dates[-1]]:
+                    self.coefficient_history_[dates[-1]][drv] = {}
+                
+                latest_params = rres.params.iloc[-1]
+                self.coefficient_history_[dates[-1]][drv][col] = (latest_params[drv], latest_params['const'])
+                
             if progress_cb:
-                progress_cb(t_idx / n, dates[t_idx])
+                progress_cb(available_drivers.index(drv) / len(available_drivers), dates[-1])
         
-        # Construct result DataFrame
-        resid_df = pd.DataFrame(result_data, index=dates, columns=resid_col_names)
-        
-        # Combine with original (keeping original columns)
+        # Combine with original
         combined = pd.concat([X, resid_df], axis=1)
         return combined.loc[:, ~combined.columns.duplicated()]
     

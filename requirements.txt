@@ -13,3 +13,4 @@ statsmodels
 beautifulsoup4>=4.12.0
 xgboost
 tensorflow
+feature-engine
