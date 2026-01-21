@@ -3,8 +3,73 @@ import numpy as np
 import pandas_datareader.data as web
 import os
 import time
+import json
 from yahooquery import Ticker
 from feature_engine.timeseries.forecasting import ExpandingWindowFeatures
+
+
+# ============================================================
+# Precomputed Feature Loading (Optimization Layer)
+# ============================================================
+
+PRECOMPUTED_DIR = 'precomputed'
+
+
+def load_precomputed_features() -> pd.DataFrame:
+    """
+    Load precomputed PIT-expanded features if available.
+
+    This is the primary optimization entry point. If precomputed data exists,
+    loading takes ~3 seconds instead of 40+ minutes of runtime PIT computation.
+
+    Returns:
+        DataFrame with precomputed features, or None if not available
+    """
+    path = f"{PRECOMPUTED_DIR}/pit_expanded_features.parquet"
+    if os.path.exists(path):
+        return pd.read_parquet(path)
+    return None
+
+
+def load_precomputed_metadata() -> dict:
+    """Load metadata about precomputed features."""
+    path = f"{PRECOMPUTED_DIR}/metadata.json"
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def is_precomputed_fresh(max_age_days: int = 45) -> bool:
+    """
+    Check if precomputed data is fresh enough.
+
+    FRED-MD updates monthly, so 45 days is a reasonable threshold.
+    """
+    metadata = load_precomputed_metadata()
+    if metadata is None:
+        return False
+
+    from datetime import datetime, timedelta
+    try:
+        created = datetime.fromisoformat(metadata['created'])
+        return (datetime.now() - created) < timedelta(days=max_age_days)
+    except (KeyError, ValueError):
+        return False
+
+
+def get_precomputed_date_range() -> tuple:
+    """Get the date range covered by precomputed features."""
+    metadata = load_precomputed_metadata()
+    if metadata is None:
+        return None, None
+
+    try:
+        start = pd.to_datetime(metadata['date_range'][0])
+        end = pd.to_datetime(metadata['date_range'][1])
+        return start, end
+    except (KeyError, ValueError):
+        return None, None
 
 try:
     import streamlit as st
