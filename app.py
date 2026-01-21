@@ -8,6 +8,17 @@ Estimation: Robust Huber Regression + Stability Selection
 """
 
 import streamlit as st
+import sys
+
+print(f"DEBUG: Script starting. __name__={__name__}")
+
+st.set_page_config(
+    page_title="Macro-Driven Strategic Asset Allocation System",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -20,6 +31,8 @@ from sklearn.model_selection import TimeSeriesSplit
 from statsmodels.regression.linear_model import OLS
 from statsmodels.stats.sandwich_covariance import cov_hac
 from scipy.stats import t
+import scipy.stats as stats
+from scipy import stats as scipy_stats
 import pandas_datareader.data as web
 import warnings
 warnings.filterwarnings('ignore')
@@ -35,6 +48,7 @@ from data_utils import (
 from benchmarking_engine import (
     Winsorizer,
     FactorStripper,
+    PointInTimeFactorStripper,
     select_features_elastic_net,
     run_benchmarking_engine,
     TF_AVAILABLE,
@@ -43,6 +57,9 @@ from benchmarking_engine import (
 from xgboost import XGBRegressor
 import os
 import pickle
+from inference import HodrickInference, NonOverlappingEstimator
+from feature_selection import AdaptiveFeatureSelector
+from prediction_intervals import BootstrapPredictionInterval, CoverageValidator
 
 def save_engine_state(results, filename='engine_state.pkl'):
     try:
@@ -145,6 +162,37 @@ def estimate_with_hac(y: pd.Series, X: pd.DataFrame, lag: int = 11) -> dict:
         'resid': model.resid
     }
 
+def estimate_with_corrected_inference(y, X, config):
+    """Dispatch to appropriate inference method."""
+    method = config.get('inference_method', 'Hodrick (1992)')
+    horizon = config.get('horizon', 12)
+    
+    if method == 'Hodrick (1992)':
+        estimator = HodrickInference(horizon=horizon)
+        # Ensure it has constant if needed - usually X passed here doesn't have it
+        import statsmodels.api as sm
+        X_const = sm.add_constant(X)
+        estimator.fit(y, X_const)
+        return {
+            'coefficients': pd.Series(estimator.coefficients_, index=X_const.columns),
+            'std_errors': pd.Series(estimator.hodrick_se_, index=X_const.columns),
+            't_stats': pd.Series(estimator.t_stats_, index=X_const.columns),
+            'p_values': pd.Series(estimator.p_values_, index=X_const.columns),
+            'r_squared': estimator.r_squared_
+        }
+    elif method == 'Non-Overlapping':
+        estimator = NonOverlappingEstimator(horizon=horizon)
+        estimator.fit(y, X)
+        return {
+            'coefficients': pd.Series(estimator.coefficients_, index=X.columns),
+            'intercept': estimator.intercept_,
+            'std_errors': pd.Series(estimator.coef_std_, index=X.columns),
+            'r_squared': None # Non-overlapping doesn't have a single R2 easily comparable
+        }
+    else:
+        # Legacy HAC
+        return estimate_with_hac(y, X, lag=horizon + 4)
+
 
 
 def estimate_robust(y: pd.Series, X: pd.DataFrame) -> dict:
@@ -180,13 +228,17 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
                               rebalance_freq: int = 12,
                               asset_class: str = 'EQUITY',
                               selection_threshold: float = 0.6,
-                              l1_ratio: float = 0.5) -> tuple:
+                              l1_ratio: float = 0.5,
+                              confidence_level: float = 0.90,
+                              progress_cb=None,
+                              X_precomputed: pd.DataFrame = None) -> tuple:
     """
     Recursive walk-forward (expanding window) backtest (V2.1 Optimized Pipeline).
     """
     
     results = []
     selection_history = []
+    coverage_validator = CoverageValidator(nominal_level=confidence_level)
     
     # 1. OPTIMIZATION: Convert to float32 to reduce memory/CPU overhead
     X = X.apply(pd.to_numeric, errors='coerce').astype('float32')
@@ -203,28 +255,26 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
     if start_idx >= len(dates):
         return pd.DataFrame(columns=['predicted_return', 'lower_ci', 'upper_ci']), pd.DataFrame()
 
-    # --- OPTIMIZATION: Vectorized Feature Engineering ---
-    # Perform expensive transformations ONCE on the full dataset.
-    # Note: FactorStripper is a linear regression. Fitting it globally introduces a 
-    # minor look-ahead bias on the orthogonality coefficients, but is standard practice 
-    # for rapid backtesting vs. strict academic purging.
+    # ----------------------------------------------------
+    if X_precomputed is not None:
+        X_expanded_global = X_precomputed
+    else:
+        # --- OPTIMIZATION: Vectorized Feature Engineering ---
+        # Perform expensive transformations ONCE on the full dataset.
+        
+        # --- [NEW] Point-in-Time Orthogonalization ---
+        # We replace global orthogonalization with PIT-safe orthogonalization.
+        pit_stripper = PointInTimeFactorStripper(drivers=big4, min_history=60)
+        X_ortho = pit_stripper.fit_transform_pit(X)
+        
+        # 2. Global Expansion (Lags, Rolling windows)
+        expander = MacroFeatureExpander()
+        X_expanded_global = expander.transform(X_ortho).astype('float32')
+        
+        # --- [FIX] Global NaN Sanitization ---
+        X_expanded_global = X_expanded_global.fillna(0)
     
-    # 1. Global Orthogonalization
-    stripper = FactorStripper(drivers=big4)
-    stripper.fit(X)
-    X_ortho_global = stripper.transform(X)
-    
-    # 2. Global Expansion (Lags, Rolling windows)
-    # This is mathematically safe to do globally as it respects time indices (no look-ahead).
-    expander = MacroFeatureExpander()
-    X_expanded_global = expander.transform(X_ortho_global).astype('float32') # Ensure float32
-    
-    # --- [FIX] Global NaN Sanitization ---
-    # Since ElasticNet/LinearRegression do not handle NaNs, and macro data often has
-    # scattered gaps or expansion lags, we fill with 0 (neutral for stationary data).
-    X_expanded_global = X_expanded_global.fillna(0)
-    
-    # Re-align after expansion (which drops initial rows due to lags)
+    # Re-align after expansion
     common_calc = X_expanded_global.index.intersection(y.index)
     X_expanded_global = X_expanded_global.loc[common_calc]
     y = y.loc[common_calc]
@@ -256,14 +306,14 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
         # We intersection with predict_idx to ensure keys exist
         X_test_expanded = X_expanded_global.loc[X_expanded_global.index.intersection(predict_idx)]
         
-        # 3. OPTIMIZATION: Single-Pass Selection (n_iterations=1)
-        # We skip the bootstrap for backtesting speed. It's close enough.
-        stable_feats, _ = select_features_elastic_net(
-            y_train_prep, X_train_prep, 
-            threshold=selection_threshold, 
-            l1_ratio=l1_ratio, 
-            n_iterations=1 # <--- KEY SPEEDUP
-        )
+        # --- [NEW] Nested CV Feature Selection ---
+        selector = AdaptiveFeatureSelector(asset_class=asset_class)
+        selector.fit(y_train_prep, X_train_prep, n_bootstrap=20)
+        stable_feats = selector.get_selected_features()
+        
+        # Store selection metadata for diagnostics if needed
+        best_alpha = selector.selector.best_alpha_
+        best_l1 = selector.selector.best_l1_ratio_
         if not stable_feats: stable_feats = X_train_prep.columns[:10].tolist()
             
         X_train_sel = X_train_prep[stable_feats].loc[:, ~X_train_prep[stable_feats].columns.duplicated()]
@@ -294,36 +344,46 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
                 model.fit(X_train_final, y_train_prep)
                 raw_preds = model.predict(X_test_final)
             elif asset_class == 'BONDS':
-                model = ElasticNet(alpha=0.01, l1_ratio=l1_ratio, max_iter=500) # Reduced max_iter
+                model = ElasticNet(alpha=best_alpha, l1_ratio=best_l1, max_iter=500) # Use CV parameters
                 model.fit(X_train_final, y_train_prep)
                 raw_preds = model.predict(X_test_final)
             else: # GOLD
-                model = LinearRegression()
+                model = LinearRegression() # GOLD still uses OLS as per spec
                 model.fit(X_train_final, y_train_prep)
                 raw_preds = model.predict(X_test_final)
             
-            # 6. HAC Adjustment
-            residuals = y_train_prep - model.predict(X_train_final)
-            se_adjusted = np.std(residuals) * np.sqrt(horizon_months)
+            # 6. Robust Prediction Intervals (Bootstrap)
+            bt_interval = BootstrapPredictionInterval(
+                confidence_level=confidence_level, 
+                n_bootstrap=50 # Reduced for backtest performance
+            )
+            bt_interval.fit(model, X_train_final, y_train_prep)
             
-        pred_vals = pd.Series(np.clip(raw_preds, -0.30, 0.30), index=X_test_expanded.index)
-        
-        n_eff = len(y_train_prep) / horizon_months
-        dof_safe = max(1, int(n_eff - X_train_final.shape[1] - 1)) if not X_train_final.empty else 10
-        t_crit = t.ppf(0.95, df=dof_safe) 
-
-        # 6. OPTIMIZATION: Reduce logging spam (Only print every 50 steps or 5 years)
-        if i % (rebalance_freq * 5) == 0:
+            # Predict
+            point_pred, lower_ci, upper_ci = bt_interval.predict_interval(X_test_final)
+            pred_vals = pd.Series(np.clip(point_pred, -0.30, 0.30), index=X_test_final.index)
+            
+        # 6. Progress Reporting
+        if progress_cb:
+            pct = (i - start_idx) / (len(dates) - start_idx)
+            progress_cb(pct, current_date)
+        elif i % (rebalance_freq * 5) == 0:
              st.write(f"&nbsp;&nbsp;&nbsp;• {asset_class} Backtest: Processing {current_date.strftime('%Y-%m')} ({i-start_idx}/{len(dates)-start_idx} steps)...")
 
-        for date in pred_vals.index:
+        for idx, date in enumerate(pred_vals.index):
             if date in y.index:
+                actual_ret = y.loc[date]
                 val = pred_vals.loc[date]
+                l_ci = lower_ci[idx]
+                u_ci = upper_ci[idx]
+                
+                coverage_validator.record(actual_ret, l_ci, u_ci)
+                
                 results.append({
                     'date': date,
                     'predicted_return': val,
-                    'lower_ci': val - (t_crit * se_adjusted),
-                    'upper_ci': val + (t_crit * se_adjusted)
+                    'lower_ci': l_ci,
+                    'upper_ci': u_ci
                 })
             
     if not results:
@@ -332,12 +392,12 @@ def run_walk_forward_backtest(y: pd.Series, X: pd.DataFrame,
     oos_df = pd.DataFrame(results).set_index('date')
     selection_df = pd.DataFrame(selection_history).set_index('date')
     
-    return oos_df, selection_df
+    return oos_df, selection_df, coverage_validator.compute_statistics()
 
 
 @st.cache_data(show_spinner=False)
-def cached_walk_forward(y, X, min_train_months=240, horizon_months=12, rebalance_freq=12, asset_class='EQUITY'):
-    return run_walk_forward_backtest(y, X, min_train_months, horizon_months, rebalance_freq, asset_class)
+def cached_walk_forward(y, X, min_train_months=240, horizon_months=12, rebalance_freq=12, asset_class='EQUITY', confidence_level=0.90):
+    return run_walk_forward_backtest(y, X, min_train_months, horizon_months, rebalance_freq, asset_class, confidence_level=confidence_level)
 
 
 
@@ -404,10 +464,14 @@ def stability_analysis(y: pd.Series, X: pd.DataFrame,
         # Estimate using Stability Selection
         selected_features, selection_probs = select_features_elastic_net(y_valid, X_valid)
         
-        # Fit OLS on selected features to get coefficients for stability analysis
+        # Fit with corrected inference on selected features
         if selected_features:
-            hac_res = estimate_with_hac(y_valid, X_valid[selected_features], lag=horizon_months//2)
-            coef_dict = hac_res['coefficients'].to_dict()
+            estimation_config = {
+                'inference_method': st.session_state.get('inference_method', 'Hodrick (1992)'),
+                'horizon': horizon_months
+            }
+            inf_res = estimate_with_corrected_inference(y_valid, X_valid[selected_features], estimation_config)
+            coef_dict = inf_res['coefficients'].to_dict()
         else:
             coef_dict = {col: 0.0 for col in X_valid.columns}
             
@@ -604,7 +668,7 @@ def get_aggregated_predictions(y, X, horizon_months=12):
         status_text.markdown(f"**Step {i+1}/3:** Generating OOS Predictions for `{asset}`...")
         progress_bar.progress((i) / len(assets))
         
-        oos_results, _ = cached_walk_forward(
+        oos_results, _, coverage_stats = cached_walk_forward(
             y[asset], 
             X, 
             min_train_months=240, 
@@ -614,6 +678,7 @@ def get_aggregated_predictions(y, X, horizon_months=12):
         )
         results_preds[asset] = oos_results['predicted_return']
         results_lower[asset] = oos_results['lower_ci']
+        # Coverage stats can be stored if needed, but not required by caller here
         
     progress_bar.progress(1.0)
     status_text.empty()
@@ -1369,28 +1434,27 @@ def plot_variable_survival(stability_results_map: dict, asset: str, descriptions
     return fig
 
 
+# Dummy comment to force cache invalidation: v4.0
 @st.cache_data(show_spinner=False)
-def get_live_model_signals(y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months):
+def get_live_model_signals_v4(y, X, l1_ratio, min_persistence, estimation_window_years, horizon_months, confidence_level=0.90):
     """
     Computes the CURRENT 'Live' mode signals based on full history (V2.0 Pipeline).
     Used for Tabs 1 (Allocation), 2 (Stable Drivers), and 3 (Series).
     """
-    expected_returns = {}
-    confidence_intervals = {}
-    driver_attributions = {}
-    stability_results_map = {}
-    model_stats = {}
+    expected_returns = {'EQUITY': 0.0, 'BONDS': 0.0, 'GOLD': 0.0}
+    confidence_intervals = {'EQUITY': [0.0, 0.0], 'BONDS': [0.0, 0.0], 'GOLD': [0.0, 0.0]}
+    driver_attributions = {'EQUITY': pd.DataFrame(), 'BONDS': pd.DataFrame(), 'GOLD': pd.DataFrame()}
+    stability_results_map = {'EQUITY': {}, 'BONDS': {}, 'GOLD': {}}
+    model_stats = {'EQUITY': {}, 'BONDS': {}, 'GOLD': {}}
     
     big4 = ['CPIAUCSL', 'INDPRO', 'M2SL', 'FEDFUNDS']
     
     for asset in ['EQUITY', 'BONDS', 'GOLD']:
-        st.write(f"🔄 **Synchronizing {asset} Model...**")
         y_asset = y[asset].dropna()
         X_base = X.loc[y_asset.index.intersection(X.index)]
         y_asset = y_asset.loc[X_base.index]
         
         # 1. Pipeline: Strip -> Expand -> Select -> Win -> Fit
-        st.write(f"&nbsp;&nbsp;&nbsp;• Pipeline: Orthogonalizing & Expanding {asset} features...")
         stripper = FactorStripper(drivers=big4)
         stripper.fit(X_base)
         
@@ -1407,10 +1471,9 @@ def get_live_model_signals(y, X, l1_ratio, min_persistence, estimation_window_ye
         # Current Set (Latest point for Live Prediction)
         X_current_expanded = X_all_expanded.tail(1)
         
-        st.write(f"&nbsp;&nbsp;&nbsp;• Stability Selection: Identifying persistent drivers for {asset}...")
         stable_features, _ = select_features_elastic_net(
             y_train_full, X_train_full, threshold=min_persistence, l1_ratio=l1_ratio,
-            n_iterations=15, st_progress=st
+            n_iterations=15, st_progress=None
         )
         if not stable_features:
             stable_features = X_train_full.columns[:10].tolist()
@@ -1428,11 +1491,10 @@ def get_live_model_signals(y, X, l1_ratio, min_persistence, estimation_window_ye
         X_current_final = win.transform(X_current_sel)
         
         # 2. Fit winner architecture
-        st.write(f"&nbsp;&nbsp;&nbsp;• Model Fitting: Training {asset} architecture...")
         
         # Safety Check: If X_current_final is empty (all NaNs dropped), fallback to last train row or 0
         if X_current_final.empty:
-            st.warning(f"⚠️ No valid macro features for {asset} at current date. Using neutral signal.")
+            # st.warning(f"⚠️ No valid macro features for {asset} at current date. Using neutral signal.")
             exp_ret = 0.0
             prediction_se = np.std(y_train_full) if not y_train_full.empty else 0.05
             hac_results = {'coefficients': pd.Series(0, index=stable_features), 'intercept': 0}
@@ -1474,11 +1536,16 @@ def get_live_model_signals(y, X, l1_ratio, min_persistence, estimation_window_ye
                 beta = pd.Series(model.coef_, index=stable_features)
 
         expected_returns[asset] = exp_ret
-        t_stat = 1.645
+        # Calculate t-stat based on confidence level
+        alpha = 1 - confidence_level
+        # Use a very safe reference
+        try:
+            t_stat = stats.t.ppf(1 - alpha/2, df=len(y_train_full)-1)
+        except:
+            t_stat = t.ppf(1 - alpha/2, df=len(y_train_full)-1)
         confidence_intervals[asset] = [exp_ret - t_stat * prediction_se, exp_ret + t_stat * prediction_se]
         
         # 3. Metrics & Attribution
-        st.write(f"&nbsp;&nbsp;&nbsp;• Computing stability metrics for {asset}...")
         stab_results = stability_analysis(y_asset, X_all_expanded[stable_features], horizon_months=horizon_months, window_years=estimation_window_years)
         metrics = compute_stability_metrics(stab_results, stable_features)
         metrics = metrics.set_index('feature')
@@ -1511,32 +1578,101 @@ def get_live_model_signals(y, X, l1_ratio, min_persistence, estimation_window_ye
         }
         model_stats[asset] = hac_results
 
+    # FINAL GUARANTEE: Explicitly check for 'EQUITY', 'BONDS', 'GOLD' in every dictionary
+    for a in ['EQUITY', 'BONDS', 'GOLD']:
+        if a not in expected_returns: expected_returns[a] = 0.0
+        if a not in confidence_intervals: confidence_intervals[a] = [0.0, 0.0]
+        if a not in driver_attributions: driver_attributions[a] = pd.DataFrame()
+        if a not in stability_results_map: stability_results_map[a] = {'metrics': pd.DataFrame(), 'stable_features': [], 'hac_results': {}, 'all_coefficients': pd.DataFrame()}
+        if a not in model_stats: model_stats[a] = {}
+        
+    print(f"DEBUG: get_live_model_signals_v4 returning keys: {list(expected_returns.keys())}")
     return expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats
 
 
-@st.cache_data(show_spinner="Running Walk-Forward Simulator (This may take a minute)...")
-def get_historical_backtest(y, X, min_train_months, horizon_months, rebalance_freq, selection_threshold, l1_ratio):
+# Global manual cache for precomputed macro data (Shared across rerun/sessions)
+MANUAL_MACRO_CACHE = {}
+
+def get_precomputed_macro_data(X: pd.DataFrame, drivers: list, min_history: int = 60, progress_cb=None):
+    """
+    Perform expensive PIT-orthogonalization and expansion ONCE.
+    Uses manual caching to allow progress updates in the UI.
+    """
+    cache_key = hash(tuple(X.index))
+    if cache_key in MANUAL_MACRO_CACHE:
+        print("DEBUG: Manual Cache HIT for Precomputed Macro Data")
+        return MANUAL_MACRO_CACHE[cache_key]
+        
+    print("DEBUG: Manual Cache MISS for Precomputed Macro Data. Computing...")
+    # 1. PIT Orthogonalization
+    pit_stripper = PointInTimeFactorStripper(drivers=drivers, min_history=min_history, update_frequency=12)
+    X_ortho = pit_stripper.fit_transform_pit(X, progress_cb=progress_cb)
+    
+    # 2. Macro Expansion
+    expander = MacroFeatureExpander()
+    X_expanded = expander.transform(X_ortho).astype('float32')
+    
+    # 3. Gap Filling
+    X_expanded = X_expanded.fillna(0)
+    
+    MANUAL_MACRO_CACHE[cache_key] = X_expanded
+    return X_expanded
+
+def get_historical_backtest(y, X, min_train_months, horizon_months, rebalance_freq, selection_threshold, l1_ratio, confidence_level=0.90):
     """
     Wrapper for the PIT Backtester to run it for all assets and cache the result.
     This drives Tabs 4 (Prediction), 5 (Diagnostics), and 6 (Backtest).
     """
     results = {}
     heatmaps = {}
+    coverage = {}
     
-    for asset in ['EQUITY', 'BONDS', 'GOLD']:
-        oos_df, sel_df = run_walk_forward_backtest(
+    import time
+    start_time = time.time()
+    
+    # Use a persistent status container in the main area
+    with st.status("🚀 **Engine Processing**: Initializing Historical Validation...", expanded=True) as status:
+        status_msg = st.empty()
+        progress_bar = st.progress(0)
+        
+        def update_pit_progress(pct, current_date):
+             progress_bar.progress(min(0.15, 0.05 + pct * 0.10))
+             elapsed = time.time() - start_time
+             m, s = divmod(int(elapsed), 60)
+             status_msg.markdown(f"**Step 1/4**: PIT Orthogonalization | Processing {current_date.strftime('%Y')} | Elapsed: {m}m {s}s")
+
+        X_precomputed = get_precomputed_macro_data(X, ['CPIAUCSL', 'INDPRO', 'M2SL', 'FEDFUNDS'], min_history=60, progress_cb=update_pit_progress)
+        
+        assets = ['EQUITY', 'BONDS', 'GOLD']
+        for a_idx, asset in enumerate(assets):
+            def update_progress(pct_inner, current_date):
+                total_pct = 0.15 + (a_idx + pct_inner) / len(assets) * 0.85
+                progress_bar.progress(min(0.99, total_pct))
+                
+                elapsed = time.time() - start_time
+                m, s = divmod(int(elapsed), 60)
+                status_msg.markdown(f"**Step {a_idx+2}/4**: {asset} Backtest | {current_date.strftime('%b %Y')} | Elapsed: {m}m {s}s")
+
+        oos_df, sel_df, coverage_stats = run_walk_forward_backtest(
             y[asset], X, 
             min_train_months=min_train_months, 
             horizon_months=horizon_months, 
             rebalance_freq=rebalance_freq, 
             asset_class=asset,
             selection_threshold=selection_threshold,
-            l1_ratio=l1_ratio
+            l1_ratio=l1_ratio,
+            confidence_level=confidence_level,
+            progress_cb=update_progress,
+            X_precomputed=X_precomputed
         )
         results[asset] = oos_df
         heatmaps[asset] = sel_df
+        coverage[asset] = coverage_stats
         
-    return results, heatmaps
+        # Complete
+        status.update(label="✅ Historical Validation Complete", state="complete", expanded=False)
+    
+    return results, heatmaps, coverage
 
 
 def plot_backtest(actual_returns: pd.Series, 
@@ -1761,12 +1897,7 @@ def generate_narrative(expected_returns: dict,
 # ============================================================================
 
 def main():
-    st.set_page_config(
-        page_title="Macro-Driven Strategic Asset Allocation System",
-        page_icon="◈",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
+    print("DEBUG: Entering main()")
     if 'theme' not in st.session_state:
         st.session_state.theme = 'dark'
     if 'sync_triggered' not in st.session_state:
@@ -1777,9 +1908,16 @@ def main():
     # Persistent Auto-Load
     if not st.session_state.sync_triggered:
         persisted = load_engine_state()
-        if persisted:
-            st.session_state.engine_results = persisted
-            st.session_state.sync_triggered = True
+        if persisted and all(k in persisted for k in ['expected_returns', 'confidence_intervals', 'model_stats']):
+            # Validate that expected_returns has all assets
+            if all(asset in persisted['expected_returns'] for asset in ['EQUITY', 'BONDS', 'GOLD']):
+                st.session_state.engine_results = persisted
+                st.session_state.sync_triggered = True
+                print("DEBUG: State loaded from disk successfully.")
+            else:
+                print("DEBUG: Persisted state missing assets. Forcing re-sync.")
+        elif persisted:
+            print("DEBUG: Persisted state incomplete. Forcing re-sync.")
         
     # Sidebar Configuration (Moved up for header visibility)
     with st.sidebar:
@@ -1818,6 +1956,13 @@ def main():
         min_persistence = st.slider("Min Persistence", 0.3, 0.9, 0.6, 0.1, help="Feature selection threshold")
         confidence_level = st.slider("Confidence Level", 0.80, 0.95, 0.90, 0.05)
         estimation_window_years = st.slider("Estimation Window (Years)", 15, 35, 25)
+        
+        inference_method = st.selectbox(
+            "Inference Method",
+            ["Hodrick (1992)", "Non-Overlapping", "HAC (Legacy)"],
+            index=0,
+            help="Method for computing standard errors with overlapping returns"
+        )
         
         alert_threshold = st.slider("Alert Threshold", 1.0, 3.0, 2.0, 0.25)
         risk_free_rate = st.sidebar.number_input("Risk-Free Rate (%)", 0.0, 10.0, 4.0) / 100
@@ -2106,45 +2251,56 @@ def main():
 
     # If synced, run logic (only if results aren't already loaded from session or disk)
     if st.session_state.engine_results is None:
-        with st.status("🛠️ **Synchronizing Macro Engine**", expanded=True) as status:
-            # A. Live Model (for current Allocation & Narrative) - Uses Latest Vintage
-            st.write("📡 **Calculating Live Model Signals...**")
-            expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats = get_live_model_signals(
-                y_live, X_live, l1_ratio, min_persistence, estimation_window_years, horizon_months
-            )
-            
-            # B. Prediction Model Validation (Revised Data Simulator) - DEFERRED
-            # st.write("📊 **Generating Prediction Diagnostics (Revised Data)...**")
-            # prediction_results, prediction_selection = get_historical_backtest(
-            #     y_live, X_live, 
-            #     min_train_months=240, 
-            #     horizon_months=horizon_months, 
-            #     rebalance_freq=12,
-            #     selection_threshold=min_persistence,
-            #     l1_ratio=l1_ratio
-            # )
-            prediction_results = None
-            prediction_selection = None
-            
-            # C. Historic Backtest (DEFERRED - Lazy Loading in Tab 6)
-            # st.write("⌛ **Running Unbiased PIT Backtest (Historical Vintages)...**")
-            # backtest_results, backtest_selection = get_historical_backtest(...)
-            
-            # Store in session state for persistence if necessary (though cached functions are usually enough)
-            st.session_state.engine_results = {
-                'expected_returns': expected_returns,
-                'confidence_intervals': confidence_intervals,
-                'driver_attributions': driver_attributions,
-                'stability_results_map': stability_results_map,
-                'model_stats': model_stats,
-                'prediction_results': prediction_results,
-                'prediction_selection': prediction_selection,
-                'backtest_results': None,  # Initialize as None
-                'backtest_selection': None # Initialize as None
-            }
-            save_engine_state(st.session_state.engine_results)
-            status.update(label="✅ **Macro Engine Synchronized (Live Mode)**", state="complete", expanded=False)
+        # A. Live Model (for current Allocation & Narrative) - Uses Latest Vintage
+        print("DEBUG: Synchronizing Live Model Signals (V4)")
+        expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats = get_live_model_signals_v4(
+            y_live, X_live, l1_ratio, min_persistence, estimation_window_years, horizon_months, confidence_level=confidence_level
+        )
+        
+        # Store in session state
+        st.session_state.engine_results = {
+            'expected_returns': expected_returns,
+            'confidence_intervals': confidence_intervals,
+            'driver_attributions': driver_attributions,
+            'stability_results_map': stability_results_map,
+            'model_stats': model_stats,
+            'prediction_results': None,
+            'prediction_selection': None,
+            'backtest_results': None,
+            'backtest_selection': None,
+            'coverage_stats': {}
+        }
+        save_engine_state(st.session_state.engine_results)
+        st.toast("✅ Macro Engine Synchronized (V4)", icon="🚀")
     
+    # CRITICAL VALIDATION: Ensure all keys exist before proceeding
+    required_keys = ['expected_returns', 'confidence_intervals', 'driver_attributions', 'stability_results_map', 'model_stats']
+    assets = ['EQUITY', 'BONDS', 'GOLD']
+    
+    state_valid = True
+    if st.session_state.engine_results is None:
+        state_valid = False
+    else:
+        for k in required_keys:
+            if k not in st.session_state.engine_results or not isinstance(st.session_state.engine_results[k], dict):
+                state_valid = False
+                break
+            if k != 'model_stats': # model_stats might be simpler
+                for a in assets:
+                    if a not in st.session_state.engine_results[k]:
+                        state_valid = False
+                        break
+    
+    if not state_valid:
+        print("DEBUG: State validation FAILED in main. Cleaning and rerunning.")
+        st.session_state.engine_results = None
+        st.session_state.sync_triggered = False
+        st.cache_data.clear()
+        if os.path.exists('engine_state.pkl'):
+            os.remove('engine_state.pkl')
+        st.warning("⚠️ Session state corruption detected. Auto-recovering...")
+        st.rerun()
+
     # Unpack for subsequent logic
     expected_returns = st.session_state.engine_results['expected_returns']
     confidence_intervals = st.session_state.engine_results['confidence_intervals']
@@ -2155,6 +2311,7 @@ def main():
     prediction_selection = st.session_state.engine_results['prediction_selection']
     backtest_results = st.session_state.engine_results['backtest_results']
     backtest_selection = st.session_state.engine_results['backtest_selection']
+    coverage_stats = st.session_state.engine_results.get('coverage_stats', {})
             
     # 4. Regime and Allocation
     regime_status, stress_score, stress_indicators = evaluate_regime(macro_data_current, alert_threshold=alert_threshold)
@@ -2181,13 +2338,22 @@ def main():
         
         # summary_panel
         summary_data = []
+        print(f"DEBUG: Rendering Summary Panel. assets=['EQUITY', 'BONDS', 'GOLD'], expected_returns keys={list(expected_returns.keys())}")
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
-            exp = expected_returns[asset]
-            ci = confidence_intervals[asset]
-            # Historical avg (approx)
-            avg_ret = y_live[asset].mean()
-            diff = exp - avg_ret
-            rec = "OVERWEIGHT" if diff > 0.01 else "UNDERWEIGHT" if diff < -0.01 else "NEUTRAL"
+            try:
+                exp = expected_returns[asset]
+                ci = confidence_intervals[asset]
+                # Historical avg (approx)
+                avg_ret = y_live[asset].mean()
+                diff = exp - avg_ret
+                rec = "OVERWEIGHT" if diff > 0.01 else "UNDERWEIGHT" if diff < -0.01 else "NEUTRAL"
+            except KeyError:
+                print(f"ERROR: KeyError accessing {asset} in expected_returns/confidence_intervals")
+                exp = 0.0
+                ci = [-0.05, 0.05]
+                avg_ret = 0.0
+                diff = 0.0
+                rec = "N/A"
             
             summary_data.append({
                 'Asset': asset,
@@ -2216,18 +2382,22 @@ def main():
         st.markdown(f'<div class="panel-header">STABLE MACRO DRIVERS (PERSISTENCE > {int(min_persistence*100)}%)</div>', unsafe_allow_html=True)
         st.info("💡 **Note**: Drivers identified based on full history (2000-Present). The Equations below are 'best fit' retrospective descriptions of the current regime.")
         for asset in ['EQUITY', 'BONDS', 'GOLD']:
-            with st.expander(f"Drivers & Equation for {asset}", expanded=(asset=='EQUITY')):
-                # Display Equation / Summary
-                st.markdown(construct_model_summary(asset, model_stats))
-                st.divider()
-                
-                attr = driver_attributions[asset]
-                # Filter for stable features only
-                stable_feats = stability_results_map[asset].get('stable_features', [])
-                attr = attr[attr['feature'].isin(stable_feats)].copy()
-                # Add absolute impact for sorting if needed, but we keep Impact column
-                attr['AbsWeight'] = attr['Weight'].abs()
-                attr = attr.sort_values('AbsWeight', ascending=False)
+            try:
+                with st.expander(f"Drivers & Equation for {asset}", expanded=(asset=='EQUITY')):
+                    # Display Equation / Summary
+                    st.markdown(construct_model_summary(asset, model_stats))
+                    st.divider()
+                    
+                    attr = driver_attributions[asset]
+                    # Filter for stable features only
+                    stable_feats = stability_results_map[asset].get('stable_features', [])
+                    attr = attr[attr['feature'].isin(stable_feats)].copy()
+                    # Add absolute impact for sorting if needed, but we keep Impact column
+                    attr['AbsWeight'] = attr['Weight'].abs()
+                    attr = attr.sort_values('AbsWeight', ascending=False)
+            except Exception as e:
+                st.error(f"Error loading drivers for {asset}: {str(e)}")
+                continue
 
                 st.markdown("""
                 <div style="font-size:0.75rem; color:var(--text-secondary); margin-bottom:0.5rem;">
@@ -2546,22 +2716,34 @@ def main():
             st.info("ℹ️ **Diagnostics Offline**: Historical validation on revised data is deferred to improve startup speed.")
             
             if st.button("📊 Run Prediction Model Validation", type="primary", key="load_step_b_tab4"):
-                with st.spinner("Running Walk-Forward Validation (Revised Data)..."):
-                    # Run Step B
-                    pred_res, pred_sel = get_historical_backtest(
-                        y_live, X_live, 
-                        min_train_months=240, 
-                        horizon_months=horizon_months, 
-                        rebalance_freq=12,
-                        selection_threshold=min_persistence,
-                        l1_ratio=l1_ratio
-                    )
-                    
-                    # Update & Persist
-                    st.session_state.engine_results['prediction_results'] = pred_res
-                    st.session_state.engine_results['prediction_selection'] = pred_sel
-                    save_engine_state(st.session_state.engine_results)
+                print("DEBUG: Triggered Prediction Validation (Tab 4)")
+                # Run Step B
+                pred_res, pred_sel, pred_cov = get_historical_backtest(
+                    y_live, X_live, 
+                    min_train_months=240, 
+                    horizon_months=horizon_months, 
+                    rebalance_freq=12,
+                    selection_threshold=min_persistence,
+                    l1_ratio=l1_ratio,
+                    confidence_level=confidence_level
+                )
+                # Update & Persist
+                if st.session_state.engine_results is None:
+                    # This should be impossible, but let's be safe
+                    st.warning("⚠️ Engine results lost. Please re-sync.")
+                    st.session_state.sync_triggered = False
                     st.rerun()
+                
+                # Make a shallow copy to avoid mutating session state in a weird way during update
+                new_results = st.session_state.engine_results.copy()
+                new_results['prediction_results'] = pred_res
+                new_results['prediction_selection'] = pred_sel
+                new_results['coverage_stats'] = pred_cov
+                st.session_state.engine_results = new_results
+                
+                save_engine_state(st.session_state.engine_results)
+                print("DEBUG: Validation Complete. Rerunning.")
+                st.rerun()
                     
         else:
             asset_to_plot = st.selectbox("Select Asset", ['EQUITY', 'BONDS', 'GOLD'], key="backtest_asset_select")
@@ -2643,21 +2825,48 @@ def main():
         if prediction_selection is None:
             st.warning("⚠️ Feature persistence history is not loaded.")
             if st.button("📊 Run Diagnostics to View Heatmaps", key="load_step_b_tab5", type="primary"):
-                 with st.spinner("Running Walk-Forward Validation (Revised Data)..."):
-                    # Run Step B
-                    pred_res, pred_sel = get_historical_backtest(
-                        y_live, X_live, 
-                        min_train_months=240, 
-                        horizon_months=horizon_months, 
-                        rebalance_freq=12,
-                        selection_threshold=min_persistence,
-                        l1_ratio=l1_ratio
-                    )
-                    st.session_state.engine_results['prediction_results'] = pred_res
-                    st.session_state.engine_results['prediction_selection'] = pred_sel
-                    save_engine_state(st.session_state.engine_results)
+                print("DEBUG: Triggered Diagnostics Validation (Tab 5)")
+                # Run Step B
+                pred_res, pred_sel, pred_cov = get_historical_backtest(
+                    y_live, X_live, 
+                    min_train_months=240, 
+                    horizon_months=horizon_months, 
+                    rebalance_freq=12,
+                    selection_threshold=min_persistence,
+                    l1_ratio=l1_ratio,
+                    confidence_level=confidence_level
+                )
+                if st.session_state.engine_results is None:
+                    st.warning("⚠️ Engine results lost. Please re-sync.")
+                    st.session_state.sync_triggered = False
                     st.rerun()
+                
+                new_results = st.session_state.engine_results.copy()
+                new_results['prediction_results'] = pred_res
+                new_results['prediction_selection'] = pred_sel
+                new_results['coverage_stats'] = pred_cov
+                st.session_state.engine_results = new_results
+                
+                save_engine_state(st.session_state.engine_results)
+                print("DEBUG: Diagnostics Complete. Rerunning.")
+                st.rerun()
         else:
+            # 🎯 Confidence Interval Coverage Validation
+            if coverage_stats:
+                st.markdown("### 🎯 Confidence Interval Coverage Validation")
+                cov_cols = st.columns(3)
+                for idx, asset in enumerate(['EQUITY', 'BONDS', 'GOLD']):
+                    stats = coverage_stats.get(asset, {})
+                    if stats:
+                        with cov_cols[idx]:
+                            cov = stats['empirical_coverage']
+                            nominal = stats['nominal_level']
+                            st.metric(f"{asset} Coverage", f"{cov:.1%}", 
+                                      delta=f"{cov-nominal:.1%}",
+                                      delta_color="normal" if abs(cov-nominal) < 0.05 else "inverse")
+                            st.caption(f"Mean Width: {stats['mean_interval_width']:.2%}")
+                st.divider()
+                
             for asset in ['EQUITY', 'BONDS', 'GOLD']:
                 with st.expander(f"Diagnostics for {asset}", expanded=(asset == 'EQUITY')):
                     if st.button(f"📊 VIEW {asset} DIAGNOSTIC DETAILS", key=f"btn_diag_{asset}"):
@@ -2849,26 +3058,28 @@ def main():
             with st.spinner("Initializing strategy engine..."):
                 # 1. Lazy Load Check for Unbiased PIT Simulation results
                 if st.session_state.engine_results['backtest_results'] is None:
-                    with st.status("⏳ **First Run Initialization:** Running Unbiased Walk-Forward Simulation on 25+ years of Point-in-Time data...", expanded=True) as status:
-                        st.write("⚙️ *Starting recursive backtest loop for EQUITY, BONDS, and GOLD...*")
-                        pit_results, pit_selection = get_historical_backtest(
-                            y_backtest, X_backtest, 
-                            min_train_months=240, 
-                            horizon_months=horizon_months, 
-                            rebalance_freq=12,
-                            selection_threshold=min_persistence,
-                            l1_ratio=l1_ratio
-                        )
-                        
-                        # Update State
-                        st.session_state.engine_results['backtest_results'] = pit_results
-                        st.session_state.engine_results['backtest_selection'] = pit_selection
-                        
-                        # Persist immediately so we don't run this again on refresh
-                        save_engine_state(st.session_state.engine_results)
-                        
-                        status.update(label="✅ PIT Simulation Complete & Cached!", state="complete", expanded=False)
-                        st.toast("PIT Simulation Complete & Cached!", icon="✅")
+                    print("DEBUG: Triggered PIT Backtest (Tab 6)")
+                    # Run Step C
+                    pit_results, pit_selection, pit_coverage = get_historical_backtest(
+                        y_backtest, X_backtest, 
+                        min_train_months=240, 
+                        horizon_months=horizon_months, 
+                        rebalance_freq=12,
+                        selection_threshold=min_persistence,
+                        l1_ratio=l1_ratio,
+                        confidence_level=confidence_level
+                    )
+                    # Update State
+                    new_results = st.session_state.engine_results.copy()
+                    new_results['backtest_results'] = pit_results
+                    new_results['backtest_selection'] = pit_selection
+                    new_results['coverage_stats'] = pit_coverage
+                    st.session_state.engine_results = new_results
+                    
+                    # Persist immediately so we don't run this again on refresh
+                    save_engine_state(st.session_state.engine_results)
+                    print("DEBUG: PIT Backtest Complete. Rerunning.")
+                    st.rerun()
 
                 # 2. Retrieve Results (Now guaranteed to exist)
                 backtest_results = st.session_state.engine_results['backtest_results']

@@ -173,6 +173,174 @@ class FactorStripper(BaseEstimator, TransformerMixin):
             return combined.loc[:, ~combined.columns.duplicated()]
         return X_df
 
+
+class PointInTimeFactorStripper(BaseEstimator, TransformerMixin):
+    """
+    Orthogonalizes features against macro drivers using ONLY historically available data.
+    Implements expanding window estimation for each time point.
+    """
+    
+    def __init__(self, drivers=['CPIAUCSL', 'INDPRO', 'M2SL', 'FEDFUNDS'], 
+                 min_history: int = 60,
+                 update_frequency: int = 12):
+        """
+        Args:
+            drivers: List of driver variable names
+            min_history: Minimum observations before fitting (default: 5 years)
+            update_frequency: Re-estimate coefficients every N periods (efficiency)
+        """
+        self.drivers = drivers
+        self.min_history = min_history
+        self.update_frequency = update_frequency
+        self.coefficient_history_ = {}  # date -> {driver -> {feature -> coef}}
+        
+    def fit_transform_pit(self, X: pd.DataFrame, progress_cb=None) -> pd.DataFrame:
+        """
+        Point-in-time fit and transform in a single pass.
+        """
+        X = X.sort_index()
+        dates = X.index
+        n = len(dates)
+        
+        available_drivers = [d for d in self.drivers if d in X.columns]
+        if not available_drivers:
+            return X
+        
+        # Pre-allocate result arrays for efficiency
+        feature_cols = [c for c in X.columns if c not in available_drivers]
+        resid_col_names = [f"{col}_resid_{drv}" 
+                          for col in feature_cols 
+                          for drv in available_drivers]
+        
+        result_data = np.full((n, len(resid_col_names)), np.nan)
+        
+        current_coefficients = {}  # driver -> {feature -> (coef, intercept)}
+        last_update_idx = -self.update_frequency - 1 # Force update on first valid point
+        
+        # Pre-extract values for fast access
+        X_values = X.values
+        driver_indices = [X.columns.get_loc(d) for d in available_drivers]
+        feature_indices = [X.columns.get_loc(f) for f in feature_cols]
+        
+        for t_idx in range(self.min_history, n):
+            # Check if we need to update coefficients
+            if t_idx - last_update_idx >= self.update_frequency:
+                if t_idx % 60 == 0: # Log every 5 years in terminal
+                    print(f"DEBUG: PIT Orthogonalization Progress: {t_idx}/{n} steps")
+                # Fit on data [0, t_idx - 1] (strictly historical)
+                X_train = X.iloc[:t_idx]
+                current_coefficients = self._fit_coefficients(X_train, available_drivers)
+                last_update_idx = t_idx
+                
+                # Store for diagnostics/reproducibility
+                self.coefficient_history_[dates[t_idx]] = current_coefficients.copy()
+            
+            # Apply current coefficients to transform X_t using pre-extracted values
+            col_idx = 0
+            for f_idx in feature_indices:
+                feat_name = feature_cols[feature_indices.index(f_idx)]
+                actual_val = X_values[t_idx, f_idx]
+                
+                for d_idx in driver_indices:
+                    drv_name = available_drivers[driver_indices.index(d_idx)]
+                    if drv_name in current_coefficients and feat_name in current_coefficients[drv_name]:
+                        coef, intercept = current_coefficients[drv_name][feat_name]
+                        driver_val = X_values[t_idx, d_idx]
+                        
+                        if not np.isnan(driver_val) and not np.isnan(actual_val):
+                            predicted = coef * driver_val + intercept
+                            result_data[t_idx, col_idx] = actual_val - predicted
+                    col_idx += 1
+            
+            # Progress reporting
+            if progress_cb and t_idx % 12 == 0:
+                progress_cb(t_idx / n, dates[t_idx])
+        
+        # Construct result DataFrame
+        resid_df = pd.DataFrame(result_data, index=dates, columns=resid_col_names)
+        
+        # Combine with original (keeping original columns)
+        combined = pd.concat([X, resid_df], axis=1)
+        return combined.loc[:, ~combined.columns.duplicated()]
+    
+    def _fit_coefficients(self, X_train: pd.DataFrame, drivers: list) -> dict:
+        """Fit orthogonalization coefficients on training data."""
+        coefficients = {}
+        
+        for driver in drivers:
+            coefficients[driver] = {}
+            driver_data = X_train[driver].dropna()
+            
+            if len(driver_data) < 24:
+                continue
+            
+            for col in X_train.columns:
+                if col == driver or col in drivers:
+                    continue
+                
+                # Pairwise complete observations
+                pair = X_train[[driver, col]].dropna()
+                if len(pair) < 24:
+                    continue
+                
+                # Simple linear regression
+                x = pair[driver].values
+                y = pair[col].values
+                
+                # Closed-form OLS
+                x_mean = x.mean()
+                y_mean = y.mean()
+                numer = np.sum((x - x_mean) * (y - y_mean))
+                denom = np.sum((x - x_mean)**2)
+                coef = numer / (denom + 1e-10)
+                intercept = y_mean - coef * x_mean
+                
+                coefficients[driver][col] = (coef, intercept)
+        
+        return coefficients
+    
+    def transform(self, X):
+        """Standard transform method required by Sklearn (uses last fitted state)."""
+        # This is for the 'live' prediction where we use the most recent coefficients
+        # In PIT backtest, we should use fit_transform_pit
+        X_df = pd.DataFrame(X)
+        if not self.coefficient_history_:
+            return X_df
+            
+        last_date = sorted(self.coefficient_history_.keys())[-1]
+        current_coefficients = self.coefficient_history_[last_date]
+        
+        new_cols = {}
+        for driver, features in current_coefficients.items():
+            if driver not in X_df.columns: continue
+            for col, (coef, intercept) in features.items():
+                if col not in X_df.columns: continue
+                new_cols[f"{col}_resid_{driver}"] = X_df[col] - (coef * X_df[driver] + intercept)
+        
+        if new_cols:
+            resids_df = pd.DataFrame(new_cols, index=X_df.index)
+            combined = pd.concat([X_df, resids_df], axis=1)
+            return combined.loc[:, ~combined.columns.duplicated()]
+        return X_df
+
+    def get_coefficient_stability(self) -> pd.DataFrame:
+        """Analyze how orthogonalization coefficients evolve over time."""
+        if not self.coefficient_history_:
+            return pd.DataFrame()
+        
+        records = []
+        for date, drivers in self.coefficient_history_.items():
+            for driver, features in drivers.items():
+                for feature, (coef, _) in features.items():
+                    records.append({
+                        'date': date,
+                        'driver': driver,
+                        'feature': feature,
+                        'coefficient': coef
+                    })
+        
+        return pd.DataFrame(records)
+
 def select_features_elastic_net(y: pd.Series, X: pd.DataFrame, 
                                  n_iterations: int = 1, # Default reduced to 1 for speed
                                  sample_fraction: float = 0.9, # Higher fraction for single run
