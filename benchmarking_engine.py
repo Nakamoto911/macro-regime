@@ -47,6 +47,9 @@ class KerasLSTMRegressor(BaseEstimator, RegressorMixin):
         # Reshape X for LSTM: (samples, timesteps, features)
         # Here we treat each observation as a single timestep sequence for simplicity
         # or we could use a sliding window, but standard tabular -> LSTM often uses (N, 1, F)
+        if hasattr(X, 'values'):
+            X = X.values
+
         X_reshaped = X.reshape((X.shape[0], 1, X.shape[1]))
         
         self.model = self._build_model((1, X.shape[1]))
@@ -57,6 +60,9 @@ class KerasLSTMRegressor(BaseEstimator, RegressorMixin):
         if not TF_AVAILABLE or self.model is None:
             return np.zeros(len(X))
             
+        if hasattr(X, 'values'):
+            X = X.values
+
         X_reshaped = X.reshape((X.shape[0], 1, X.shape[1]))
         return self.model.predict(X_reshaped).flatten()
 
@@ -383,7 +389,7 @@ def run_benchmarking_engine(X: pd.DataFrame, y: pd.Series, start_idx: int, step:
             # Find integer positions for valid_test_idx in X_test_expanded
             # Since X_test_final is a numpy array from transform, we need to index it correctly
             test_positions = [X_test_expanded.index.get_loc(idx) for idx in valid_test_idx]
-            X_test_input = X_test_final[test_positions]
+            X_test_input = X_test_final.iloc[test_positions]
             
             preds = m.predict(X_test_input)
             preds = np.clip(preds, -0.30, 0.30)
@@ -402,10 +408,13 @@ def run_benchmarking_engine(X: pd.DataFrame, y: pd.Series, start_idx: int, step:
         ic, _ = spearmanr(valid_actuals, preds)
         # RMSE
         rmse = np.sqrt(mean_squared_error(valid_actuals, preds))
+        # Hit Rate
+        hit_rate = (np.sign(valid_actuals) == np.sign(preds)).mean()
         
         summary.append({
             "Model": name,
             "OOS IC (Corr)": ic,
+            "OOS Hit Rate": hit_rate,
             "OOS RMSE": rmse
         })
         

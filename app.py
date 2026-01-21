@@ -2599,9 +2599,21 @@ def main():
                 st.plotly_chart(fig_backtest, width='stretch')
                 
                 # Stats
+                # Stats
                 corr = actual_oos.corr(oos_results['predicted_return'])
                 rmse = np.sqrt(((actual_oos - oos_results['predicted_return'])**2).mean())
-                st.markdown(f"**OOS Correlation:** {corr:.2f} | **OOS RMSE:** {rmse:.2%}")
+                
+                # Hit Rate (Directional Accuracy)
+                hits = np.sign(actual_oos) == np.sign(oos_results['predicted_return'])
+                hit_rate = hits.mean()
+                
+                hit_rate_str = f"{hit_rate:.1%}"
+                if hit_rate > 0.55:
+                    hit_rate_str = f"**{hit_rate_str}**"
+                elif hit_rate < 0.45:
+                     hit_rate_str = f"{hit_rate_str}"
+                
+                st.markdown(f"**OOS Correlation:** {corr:.2f} | **Hit Rate:** {hit_rate_str} | **OOS RMSE:** {rmse:.2%}")
             else:
                 st.warning("Insufficient data for Walk-Forward Model Validation.")
 
