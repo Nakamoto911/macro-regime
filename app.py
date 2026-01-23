@@ -64,6 +64,8 @@ def main():
         est_window = st.slider("Estimation Window (Years)", 15, 35, 25)
         inf_method = st.selectbox("Inference Method", ["Hodrick (1992)", "Non-Overlapping", "HAC (Legacy)"])
         st.session_state.inference_method = inf_method
+        intercept_mode = st.selectbox("Intercept Mode", ["standard", "hybrid"], index=1, help="Hybrid: De-trended Physics + Recalibrated Bias")
+        calib_window = st.slider("Calibration Window (Months)", 12, 120, 60)
         alert_thresh = st.slider("Alert Threshold", 1.0, 3.0, 2.0)
         risk_free = st.sidebar.number_input("Risk-Free Rate (%)", 0.0, 10.0, 4.0) / 100
 
@@ -127,7 +129,8 @@ def main():
             st.write("Generating live signals...")
             expected_returns, confidence_intervals, driver_attributions, stability_results_map, model_stats = get_live_model_signals_v4(
                 y_live, X_live, l1_ratio, min_persistence, est_window, horizon_months, 
-                confidence_level=confidence_level, prices=asset_prices, macro_data=vser_macro_data
+                confidence_level=confidence_level, prices=asset_prices, macro_data=vser_macro_data,
+                intercept_mode=intercept_mode, calibration_window=calib_window
             )
             
             st.write("Executing optimized backtest...")
