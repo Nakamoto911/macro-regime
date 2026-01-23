@@ -22,6 +22,8 @@ import os
 import time
 import json
 from datetime import datetime
+from data_utils import load_fred_md_data
+
 
 # Configuration
 FRED_MD_FILE = '2025-11-MD.csv'
@@ -32,54 +34,7 @@ SLOPE_WINDOWS = [3, 6, 9, 12, 18, 24]
 LAG_WINDOWS = [1, 3, 6]
 
 
-def apply_transformation(series: pd.Series, tcode: int) -> pd.Series:
-    """McCracken & Ng (2016) transformation codes."""
-    if tcode == 1:
-        return series
-    elif tcode == 2:
-        return series.diff()
-    elif tcode == 3:
-        return series.diff().diff()
-    elif tcode == 4:
-        return np.log(series.replace(0, np.nan))
-    elif tcode == 5:
-        return np.log(series.replace(0, np.nan)).diff()
-    elif tcode == 6:
-        return np.log(series.replace(0, np.nan)).diff().diff()
-    elif tcode == 7:
-        return series.pct_change().diff()
-    else:
-        return series
 
-
-def load_and_transform_fred_md(file_path: str) -> pd.DataFrame:
-    """Load FRED-MD and apply stationarity transforms."""
-    print(f"  Loading from {file_path}...")
-    df_raw = pd.read_csv(file_path)
-
-    # First row contains transformation codes
-    tcodes = df_raw.iloc[0, 1:]
-    df = df_raw.iloc[1:].copy()
-
-    # Parse dates
-    df['sasdate'] = pd.to_datetime(df['sasdate'], utc=True, errors='coerce').dt.tz_localize(None)
-    df = df.dropna(subset=['sasdate']).set_index('sasdate')
-    df.index = df.index + pd.offsets.MonthEnd(0)
-
-    # Apply transformations
-    transformed = {}
-    for col in df.columns:
-        if col in tcodes.index:
-            tcode = pd.to_numeric(tcodes[col], errors='coerce')
-            if not pd.isna(tcode):
-                transformed[col] = apply_transformation(pd.to_numeric(df[col], errors='coerce'), int(tcode))
-            else:
-                transformed[col] = pd.to_numeric(df[col], errors='coerce')
-        else:
-            transformed[col] = pd.to_numeric(df[col], errors='coerce')
-
-    result = pd.DataFrame(transformed, index=df.index)
-    return result.replace([np.inf, -np.inf], np.nan)
 
 
 def _orthogonalize_single_feature(col: str, drv: str, X: pd.DataFrame, min_history: int) -> tuple:
@@ -244,11 +199,12 @@ def main():
         print("Please ensure the FRED-MD data file exists in the current directory.")
         return
 
-    # Step 1: Load and transform
-    print("\n[1/4] Loading FRED-MD data...")
-    X_raw = load_and_transform_fred_md(FRED_MD_FILE)
+    # Step 1: Load and transform (includes Cointegration Discovery)
+    print("\n[1/4] Loading FRED-MD data (with Cointegration)...")
+    X_raw = load_fred_md_data(FRED_MD_FILE)
     print(f"  Loaded: {X_raw.shape[0]} observations x {X_raw.shape[1]} variables")
     print(f"  Date range: {X_raw.index[0].strftime('%Y-%m')} to {X_raw.index[-1].strftime('%Y-%m')}")
+
 
     # Step 2: PIT Orthogonalization
     print("\n[2/4] Computing PIT orthogonalization...")

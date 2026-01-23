@@ -6,6 +6,9 @@ import time
 import json
 from yahooquery import Ticker
 from feature_engine.timeseries.forecasting import ExpandingWindowFeatures
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.regression.rolling import RollingOLS
 
 
 # ============================================================
@@ -213,12 +216,345 @@ class MacroFeatureExpander:
         return unique_features
 
 
+class CointegrationEngine:
+    """
+    Discovers and generates cointegrated 'Spread' features from Raw Levels.
+    Captures long-term equilibrium relationships (Level information) to complement Momentum features.
+    """
+    def __init__(self, manifest_path=f'{PRECOMPUTED_DIR}/cointegration_manifest.json'):
+        self.manifest_path = manifest_path
+        self.manifest = {}
+        # Dynamic Cointegration - Rolling Window Size
+        self.rolling_window = 120 # 10 Years
+        
+        # Targets: Anything Trending
+        # We will dynamically populate this from the data, but keep a core list for reference
+        self.targets = ['S&P 500', 'SP500', 'EQUITY', 'CPIAUCSL', 'GS10', 'DGS10', 'UNRATE', 'HOUST', 'AAA', 'BAA'] 
+        
+        # Anchors: Restricted "Macro Majors" to save compute and focus on structural pairs
+        self.anchors = ['M2SL', 'GDP', 'GDPC1', 'INDPRO', 'CPIAUCSL', 'PCEPI'] 
+        
+    def classify_integration_order(self, df_raw: pd.DataFrame) -> dict:
+        """
+        Classify variables as Stationary (I(0)) or Trending (I(1)) using ADF test.
+        Returns dictionary with 'stationary' and 'trending' lists.
+        """
+        print("Classifying Integration Order (I(0) vs I(1))...")
+        stationary = []
+        trending = []
+        
+        numeric_df = df_raw.select_dtypes(include=[np.number]).dropna(axis=1, how='all')
+        
+        for col in numeric_df.columns:
+            series = numeric_df[col].dropna()
+            if len(series) < 36: # Min history for reliable ADF
+                continue
+                
+            try:
+                # ADF Test
+                # Null Hypothesis: Non-Stationary (Unit Root)
+                # p < 0.05 => Reject Null => Stationary
+                res = adfuller(series, maxlag=12, autolag='AIC')
+                p_value = res[1]
+                
+                if p_value < 0.05:
+                    stationary.append(col)
+                else:
+                    trending.append(col)
+            except:
+                continue
+                
+        print(f"  Classification: {len(stationary)} Stationary, {len(trending)} Trending")
+        return {"stationary": stationary, "trending": trending}
+
+    def fit(self, df_raw: pd.DataFrame):
+        """
+        Discover cointegrated pairs from raw data.
+        df_raw: DataFrame of Raw Levels (Time Series)
+        """
+        print("Discovering Cointegration Pairs...")
+        # 1. Pre-filter & Clean
+        numeric_df = df_raw.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all')
+        
+        # Logarithmic candidates (Strictly positive)
+        # Relaxed check: if 95% of data is > 0, we can use log (shutting out 0s)
+        log_candidates = []
+        for c in numeric_df.columns:
+            series = numeric_df[c].dropna()
+            if len(series) > 0 and (series > 0).mean() > 0.95:
+                log_candidates.append(c)
+        
+        print(f"  Log Candidates: {len(log_candidates)} found")
+        
+        # 1.5 Classify Integration Order
+        classification = self.classify_integration_order(df_raw)
+        trending_vars = set(classification['trending'])
+        stationary_vars = set(classification['stationary'])
+        
+        print(f"  Skipping Stationary Targets: {list(set(self.targets) & stationary_vars)}")
+        
+        # Filter Universe: Only I(1) variables can be cointegrated
+        # Dynamic: Allow ALL trending variables as potential targets
+        all_trending = list(trending_vars)
+        valid_targets = [t for t in all_trending if t in numeric_df.columns]
+        
+        # Anchors restricted to Macro Majors
+        valid_anchors = [a for a in self.anchors if a in trending_vars and a in numeric_df.columns]
+        
+        print(f"  Scanning Cointegration: {len(valid_targets)} Targets vs {len(valid_anchors)} Anchors (Rolling OLS)...")
+        
+        candidates = []
+        
+        # 2. Pairwise Search
+        # Iterate combinations
+        for target in valid_targets:
+            for anchor in valid_anchors:
+                # Map potential names (e.g. S&P 500 might be SP500)
+                # For now assume exact match or presence in columns
+                t_col = target if target in numeric_df.columns else None
+                a_col = anchor if anchor in numeric_df.columns else None
+                
+                if not t_col or not a_col or t_col == a_col:
+                    continue
+                    
+                # Setup Series
+                Y = numeric_df[t_col]
+                X = numeric_df[a_col]
+                
+                # Apply Log if applicable
+                use_log = False
+                if t_col in log_candidates and a_col in log_candidates:
+                    # Safe Log
+                    Y = np.log(Y.replace(0, np.nan))
+                    X = np.log(X.replace(0, np.nan))
+                    use_log = True
+                    
+                # Align
+                common_idx = Y.index.intersection(X.index)
+                if len(common_idx) < 60: # Min history
+                    continue
+                    
+                Y_aligned = Y.loc[common_idx]
+                X_aligned = X.loc[common_idx]
+                
+                # 3. Dynamic Cointegration Test (Rolling OLS)
+                # Filter NaNs/Infs
+                valid_mask = np.isfinite(Y_aligned) & np.isfinite(X_aligned)
+                Y_aligned = Y_aligned[valid_mask]
+                X_aligned = X_aligned[valid_mask]
+                
+                if len(Y_aligned) < self.rolling_window + 24:
+                     continue
+
+                try:
+                    X_exog = sm.add_constant(X_aligned)
+                    
+                    # Fit Rolling OLS
+                    rols = RollingOLS(Y_aligned, X_exog, window=self.rolling_window)
+                    rres = rols.fit()
+                    
+                    params = rres.params
+                    if 'const' in params.columns and a_col in params.columns:
+                        alpha_t = params['const']
+                        beta_t = params[a_col]
+                        
+                        # Dynamic Residuals
+                        spread = Y_aligned - (alpha_t + beta_t * X_aligned)
+                        spread_valid = spread.dropna()
+                        
+                        if len(spread_valid) < 60:
+                            continue
+                            
+                        # ADF Test on Dynamic Residuals
+                        adf_result = adfuller(spread_valid, maxlag=12, autolag='AIC')
+                        p_value = adf_result[1]
+                        
+                        # Threshold (0.05)
+                        if p_value < 0.05:
+                            pair_name = f"spread_{t_col}_{a_col}"
+                            candidate_info = {
+                                "name": pair_name,
+                                "y": t_col,
+                                "x": a_col,
+                                "is_log": use_log,
+                                "p_value": p_value,
+                                "window": self.rolling_window,
+                                "type": "dynamic_rolling_ols"
+                            }
+                            candidates.append(candidate_info)
+                            # print(f"  Found Dynamic Cointegration: {pair_name} (p={p_value:.4f})")
+                        else:
+                            if t_col in ['S&P 500', 'EQUITY', 'SP500', 'CPIAUCSL'] and a_col in ['M2SL', 'GDP']:
+                                 print(f"  Rejected Dynamic: {t_col} vs {a_col} (p={p_value:.4f})")
+                except Exception as e:
+                    # print(f"Error testing {t_col} vs {a_col}: {e}")
+                    continue
+        
+        # Post-Search: Top-N Filtering
+        # 1. Separate Priority Candidates (e.g. S&P 500)
+        priority_targets = ['S&P 500', 'SP500', 'EQUITY', 'CPIAUCSL']
+        priority_candidates = []
+        other_candidates = []
+        
+        for c in candidates:
+            if c['y'] in priority_targets:
+                priority_candidates.append(c)
+            else:
+                other_candidates.append(c)
+                
+        # 2. Sort both lists by p-value
+        priority_candidates.sort(key=lambda x: x['p_value'])
+        other_candidates.sort(key=lambda x: x['p_value'])
+        
+        # 3. Fill quotas
+        # Force keep up to 10 priority pairs
+        max_priority = 10
+        final_selection = priority_candidates[:max_priority]
+        
+        # Fill the rest with best remaining
+        slots_remaining = 50 - len(final_selection)
+        final_selection.extend(other_candidates[:slots_remaining])
+        
+        # Sort final selection by p-value for consistency
+        final_selection.sort(key=lambda x: x['p_value'])
+        
+        print(f"  Pruning: Kept {len(final_selection)} pairs (Priority Rescued: {len(priority_candidates[:max_priority])}).")
+        if final_selection:
+            worst_best_p = final_selection[-1]['p_value']
+            print(f"  Cutoff P-Value: {worst_best_p:.6f}")
+            
+        discovered_pairs = {c['name']: {k:v for k,v in c.items() if k != 'name'} for c in final_selection}
+        
+        self.manifest = discovered_pairs
+        self._save_manifest()
+        return self
+
+    def transform(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+        """
+        Generate Spread features based on manifest.
+        """
+        if not self.manifest:
+            self._load_manifest()
+            
+        if not self.manifest:
+            # If still empty after load, and we have raw data, maybe try to fit?
+            # Or just return empty
+             # For safety in this specific task flow, we check if we should auto-fit
+             if not os.path.exists(self.manifest_path):
+                 print("  Manifest not found. Running Discovery (fit)...")
+                 self.fit(df_raw)
+             else:
+                 return pd.DataFrame(index=df_raw.index)
+
+        numeric_df = df_raw.apply(pd.to_numeric, errors='coerce')
+        spreads = {}
+        
+        for name, config in self.manifest.items():
+            try:
+                y_col = config['y']
+                x_col = config['x']
+                
+                if y_col not in numeric_df.columns or x_col not in numeric_df.columns:
+                    continue
+                    
+                Y = numeric_df[y_col]
+                X = numeric_df[x_col]
+                
+                if config.get('is_log', False):
+                    # Safety against <= 0
+                    Y = np.log(Y.replace(0, np.nan))
+                    X = np.log(X.replace(0, np.nan))
+                    
+                # Dynamic Transform (Must match fit logic)
+                window = config.get('window', 120)
+                
+                # Align
+                common_idx = Y.index.intersection(X.index)
+                Y_aligned = Y.loc[common_idx]
+                X_aligned = X.loc[common_idx]
+                
+                # Drop NaNs/Infs for calculation
+                valid = np.isfinite(Y_aligned) & np.isfinite(X_aligned)
+                Y_calc = Y_aligned[valid]
+                X_calc = X_aligned[valid]
+                
+                if len(Y_calc) < window + 12:
+                    continue
+
+                # Recalculate Rolling Parameters
+                # NOTE: Ideally we would cache these, but for now we recompute on the fly
+                # It's reasonably fast for 10-20 pairs.
+                X_exog = sm.add_constant(X_calc)
+                rols = RollingOLS(Y_calc, X_exog, window=window)
+                rres = rols.fit()
+                params = rres.params
+                
+                # Dynamic Spread
+                alpha_t = params['const']
+                beta_t = params[x_col]
+                
+                # Re-index to original DF if needed, but here we just use the calculated index
+                spread_series = Y_calc - (alpha_t + beta_t * X_calc)
+                
+                # Reindex back to full df_raw index to handle gaps (forward fill static parameters? No, leave NaN)
+                spread_full = spread_series.reindex(df_raw.index)
+                
+                # Post-Processing: Z-Score (Rolling 60m) to normalize magnitude
+                # Use a long robust window to keep it stationary but scaled
+                # Standardization is critical for the model to treat it like other % features
+                spread_z = (spread_full - spread_full.rolling(60, min_periods=24).mean()) / (spread_full.rolling(60, min_periods=24).std() + 1e-9)
+                
+                spreads[name] = spread_z
+                
+            except Exception as e:
+                print(f"Failed to generate {name}: {e}")
+                
+        return pd.DataFrame(spreads, index=df_raw.index)
+
+    def _save_manifest(self):
+        if not os.path.exists(PRECOMPUTED_DIR):
+            os.makedirs(PRECOMPUTED_DIR)
+        with open(self.manifest_path, 'w') as f:
+            json.dump(self.manifest, f, indent=2)
+            
+    def _load_manifest(self):
+        if os.path.exists(self.manifest_path):
+            with open(self.manifest_path, 'r') as f:
+                self.manifest = json.load(f)
+
+
 def prepare_macro_features(macro_data: pd.DataFrame) -> pd.DataFrame:
     """
-    Legacy wrapper for MacroFeatureExpander.
+    Apply Feature Expansion to Macro Data.
+    Optimization: Splits 'Spread' features (Lightweight) vs 'Macro' features (Heavyweight).
     """
+    # Identify spread columns (from Cointegration Engine)
+    spread_cols = [c for c in macro_data.columns if c.startswith('spread_')]
+    macro_cols = [c for c in macro_data.columns if c not in spread_cols]
+    
+    # 1. Full Expansion for Standard Macro Columns
+    # (Generating Slopes, Volatility, Impulse, Expanding Stats)
+    df_macro = macro_data[macro_cols]
     expander = MacroFeatureExpander()
-    return expander.transform(macro_data)
+    df_macro_expanded = expander.transform(df_macro)
+    
+    # 2. Lightweight Expansion for Spread columns
+    # (Checking Stationarity is already done, we just need history)
+    # No Slopes (Spread is already a diff), No Vol (Spread is Z-scored).
+    # Just Lags.
+    if spread_cols:
+        df_spreads = macro_data[spread_cols]
+        spread_features_list = [df_spreads] # Keep base Z-score spreads
+        
+        for lag in [1, 3]:
+             spread_features_list.append(df_spreads.shift(lag).add_suffix(f"_lag{lag}"))
+             
+        df_spreads_expanded = pd.concat(spread_features_list, axis=1)
+        
+        # Merge
+        return pd.concat([df_macro_expanded, df_spreads_expanded], axis=1)
+    
+    return df_macro_expanded
 
 
 @cache_data_wrapper
@@ -252,6 +588,19 @@ def load_fred_md_data(file_path: str = '2025-11-MD.csv') -> pd.DataFrame:
                     transformed_cols[col] = pd.to_numeric(df[col], errors='coerce')
             
             data = pd.DataFrame(transformed_cols, index=df.index)
+            
+            # Branch B: Cointegration (Levels)
+            try:
+                # Pass clean numeric raw data to engine
+                df_numeric = df.apply(pd.to_numeric, errors='coerce')
+                coint_engine = CointegrationEngine()
+                levels_df = coint_engine.transform(df_numeric)
+                
+                if not levels_df.empty:
+                    data = pd.concat([data, levels_df], axis=1)
+            except Exception as e:
+                print(f"Cointegration integration warning: {e}")
+
         else:
             # Assume it's a PIT matrix (already processed or requires index-based handling)
             df = df_raw.copy()

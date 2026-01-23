@@ -1,0 +1,402 @@
+{
+  "spread_IPB51222S_INDPRO": {
+    "y": "IPB51222S",
+    "x": "INDPRO",
+    "is_log": true,
+    "p_value": 3.563682220519218e-09,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_ISRATIOx_CPIAUCSL": {
+    "y": "ISRATIOx",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 1.134761984862084e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_ISRATIOx_PCEPI": {
+    "y": "ISRATIOx",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 1.2195416665527228e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_ISRATIOx_M2SL": {
+    "y": "ISRATIOx",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 1.5087647957182009e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS1_CPIAUCSL": {
+    "y": "GS1",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 1.687829753992926e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS1_PCEPI": {
+    "y": "GS1",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 1.767493024166467e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS1_M2SL": {
+    "y": "GS1",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 1.8566035343589214e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_AMDMUOx_M2SL": {
+    "y": "AMDMUOx",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 2.0584586564270734e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_TB6MS_M2SL": {
+    "y": "TB6MS",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 3.227907641442965e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_BUSLOANS_M2SL": {
+    "y": "BUSLOANS",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 4.126685465240135e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_TB3MS_M2SL": {
+    "y": "TB3MS",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 5.187579216599679e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS5_PCEPI": {
+    "y": "GS5",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 5.446153593714136e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_CES3000000008_CPIAUCSL": {
+    "y": "CES3000000008",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 5.6129730872469226e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS5_CPIAUCSL": {
+    "y": "GS5",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 6.095984934461732e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_AMDMNOx_CPIAUCSL": {
+    "y": "AMDMNOx",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 6.2450793715513985e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_AMDMNOx_PCEPI": {
+    "y": "AMDMNOx",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 6.7654265071436205e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_TB6MS_CPIAUCSL": {
+    "y": "TB6MS",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 6.801929790730458e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_TB6MS_PCEPI": {
+    "y": "TB6MS",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 7.217721584013025e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_NONREVSL_M2SL": {
+    "y": "NONREVSL",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 8.629908174574221e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_CP3Mx_CPIAUCSL": {
+    "y": "CP3Mx",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 8.69534782404611e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_UEMP27OV_M2SL": {
+    "y": "UEMP27OV",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 8.73010571156306e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_AWOTMAN_INDPRO": {
+    "y": "AWOTMAN",
+    "x": "INDPRO",
+    "is_log": true,
+    "p_value": 8.909438862084035e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_USWTRADE_CPIAUCSL": {
+    "y": "USWTRADE",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 9.536989794259976e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_CP3Mx_PCEPI": {
+    "y": "CP3Mx",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 9.72866583892107e-06,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_TB3MS_PCEPI": {
+    "y": "TB3MS",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 1.1209269856287048e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_TB3MS_CPIAUCSL": {
+    "y": "TB3MS",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 1.1702070252862115e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_USWTRADE_PCEPI": {
+    "y": "USWTRADE",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 1.3389622601290176e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_HWI_PCEPI": {
+    "y": "HWI",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 1.386793810733764e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_IPFUELS_M2SL": {
+    "y": "IPFUELS",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 1.4103072373944083e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_HWI_M2SL": {
+    "y": "HWI",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 1.5089952539517558e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_AMDMUOx_CPIAUCSL": {
+    "y": "AMDMUOx",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 1.6059099907734324e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_HWI_CPIAUCSL": {
+    "y": "HWI",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 1.730207304143509e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_CP3Mx_M2SL": {
+    "y": "CP3Mx",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 1.865317629022802e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_FEDFUNDS_CPIAUCSL": {
+    "y": "FEDFUNDS",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 2.7410280096433525e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_INVEST_CPIAUCSL": {
+    "y": "INVEST",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 2.8046343659739055e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_FEDFUNDS_PCEPI": {
+    "y": "FEDFUNDS",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 2.8095302768192158e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_USFIRE_PCEPI": {
+    "y": "USFIRE",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 3.254031222429948e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_USFIRE_CPIAUCSL": {
+    "y": "USFIRE",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 3.259065562657692e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_IPFINAL_CPIAUCSL": {
+    "y": "IPFINAL",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 3.937529689078267e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_INVEST_PCEPI": {
+    "y": "INVEST",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 3.950466939828126e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS10_CPIAUCSL": {
+    "y": "GS10",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 4.9195742048415254e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_GS10_PCEPI": {
+    "y": "GS10",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 5.1473990976679425e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_REALLN_INDPRO": {
+    "y": "REALLN",
+    "x": "INDPRO",
+    "is_log": true,
+    "p_value": 5.42950670555868e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_RPI_CPIAUCSL": {
+    "y": "RPI",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 6.712698934765966e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_USFIRE_M2SL": {
+    "y": "USFIRE",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 7.077806193569524e-05,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_CPIAUCSL_M2SL": {
+    "y": "CPIAUCSL",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 0.0022925493381038536,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_S&P 500_CPIAUCSL": {
+    "y": "S&P 500",
+    "x": "CPIAUCSL",
+    "is_log": true,
+    "p_value": 0.00859567308382513,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_S&P 500_PCEPI": {
+    "y": "S&P 500",
+    "x": "PCEPI",
+    "is_log": true,
+    "p_value": 0.009735065838211716,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_S&P 500_M2SL": {
+    "y": "S&P 500",
+    "x": "M2SL",
+    "is_log": true,
+    "p_value": 0.027618969712823523,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  },
+  "spread_CPIAUCSL_INDPRO": {
+    "y": "CPIAUCSL",
+    "x": "INDPRO",
+    "is_log": true,
+    "p_value": 0.028337318739121615,
+    "window": 120,
+    "type": "dynamic_rolling_ols"
+  }
+}
