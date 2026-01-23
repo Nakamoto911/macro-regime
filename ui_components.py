@@ -149,7 +149,7 @@ def render_prediction_tab(prediction_results, y_live, horizon_months, min_persis
             st.markdown("---")
             st.markdown('<div style="color: #00d26a; font-family: monospace; font-size: 0.8rem;">SHARE TO LLM</div>', unsafe_allow_html=True)
             if st.button("📋 Copy Prediction Report", use_container_width=True, type="secondary"):
-                report_md = generate_llm_report(prediction_results, y_live, confidence_level, model_stats)
+                report_md = generate_llm_report(prediction_results, y_live, confidence_level, model_stats, y_nominal=y_nominal_live)
                 st.session_state.llm_report = report_md
                 st.toast("Report generated! See below.")
 

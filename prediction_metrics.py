@@ -271,7 +271,7 @@ def construct_model_summary(asset: str, model_stats: dict) -> str:
             res += f" {'+' if val >= 0 else '-'} (`{abs(val):.4f}` * {feat})"
         return res
 
-def generate_llm_report(prediction_results: Dict[str, pd.DataFrame], y_live: pd.DataFrame, confidence_level: float, model_stats: Optional[Dict] = None) -> str:
+def generate_llm_report(prediction_results: Dict[str, pd.DataFrame], y_live: pd.DataFrame, confidence_level: float, model_stats: Optional[Dict] = None, y_nominal: Optional[pd.DataFrame] = None) -> str:
     """
     Generate a comprehensive Markdown report for LLM analysis.
     """
@@ -283,7 +283,12 @@ def generate_llm_report(prediction_results: Dict[str, pd.DataFrame], y_live: pd.
         if oos.empty or asset not in y_live.columns:
             continue
             
-        actual = y_live[asset].loc[oos.index]
+        # Select actuals: Use nominal if provided, otherwise use live
+        if y_nominal is not None and asset in y_nominal.columns:
+            actual = y_nominal[asset].loc[oos.index]
+        else:
+            actual = y_live[asset].loc[oos.index]
+            
         metrics = compute_all_metrics(
             actual=actual,
             predicted=oos['predicted_return'],
