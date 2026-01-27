@@ -106,7 +106,11 @@ def render_drivers_tab(min_persistence, model_stats, driver_attributions, stabil
             if not attr.empty:
                 stable_feats = stability_results_map.get(asset, {}).get('stable_features', [])
                 df_disp = attr[attr['feature'].isin(stable_feats)].copy()
-                sel = st.dataframe(df_disp[['feature', 'Signal', 'Impact', 'Weight', 'State', 'Link']], hide_index=True, width='stretch', on_select='rerun', selection_mode='single-row', key=f"sel_{asset}")
+                
+                # Add Description column
+                df_disp['Description'] = df_disp['feature'].apply(lambda x: descriptions.get(x.split('_')[0], x.split('_')[0]))
+                
+                sel = st.dataframe(df_disp[['feature', 'Description', 'Signal', 'Impact', 'Weight', 'State', 'Link']], hide_index=True, width='stretch', on_select='rerun', selection_mode='single-row', key=f"sel_{asset}")
                 if sel.get('selection', {}).get('rows'):
                     feat = df_disp.iloc[sel['selection']['rows'][0]]['feature']
                     st.plotly_chart(plot_combined_driver_analysis(X_live, y_forward, feat, asset, descriptions, horizon_months=horizon_months), width='stretch', key=f"driver_analysis_{asset}")
